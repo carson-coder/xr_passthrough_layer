@@ -21,7 +21,7 @@
     ];
   in with pkgs; {
     devShells.${system}.default = mkShell {
-      nativeBuildInputs = [ pkg-config cmake rust-toolchain cargo-bloat ];
+      nativeBuildInputs = [ pkg-config cmake rust-toolchain rust-analyzer-nightly cargo-bloat ];
       buildInputs = [ systemdLibs linuxHeaders openvr xorg.libxcb ];
       shellHook = ''
         export LD_LIBRARY_PATH="${lib.makeLibraryPath [ libglvnd vulkan-loader util-linux shaderc ]}:$LD_LIBRARY_PATH"

@@ -6,8 +6,14 @@
 // and `sample_yuyv2` will be no-op.
 // UNDISTORT: whether to apply lens undistortion.
 
-layout(binding = 0) uniform sampler2D inputTex;
-layout(binding = 1) uniform DistortionParameters {
+layout(binding = 0) uniform Transform {
+	mat4 mvp[2];
+	float overlayWidth;
+	vec2 eyeOffset;
+};
+layout(binding = 1) uniform sampler2D inputTex;
+#ifdef UNDISTORT
+layout(binding = 2) uniform DistortionParameters {
     // Parameters are per-eye
     // 0 = left, 1 = right
 
@@ -22,8 +28,9 @@ layout(binding = 1) uniform DistortionParameters {
     // 0 = left, 1 = right
     vec2 scale[2];
     // Pixel size of the sensor_width
-    float sensorSize;
+    //float sensorSize;
 };
+#endif
 
 // Input coordinates -0.5 ~ 0.5
 // relative to the center of the undistorted image,

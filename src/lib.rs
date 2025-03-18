@@ -1,27 +1,65 @@
 #![deny(rust_2018_idioms)]
-#![cfg_attr(
-    not(any(feature = "openvr", feature = "openxr")),
-    allow(warnings, unused)
-)]
+mod camera;
 mod config;
-//mod events;
-//#[cfg(feature = "openvr")]
-//mod openvr;
 mod pipeline;
-mod projection;
 mod steam;
 mod utils;
+mod xr;
+use ash::khr::swapchain;
+use smallvec::smallvec;
+use winit::{
+    dpi::PhysicalSize,
+    event::{Event, WindowEvent},
+    event_loop::{ControlFlow, EventLoop},
+    window::WindowBuilder,
+};
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashSet,
+    future,
+    sync::{atomic::AtomicBool, Arc, Mutex},
+};
 
 use anyhow::{anyhow, Context, Result};
 
+use glam::UVec2;
+use pipeline::PostprocessPipeline as _;
 use v4l::video::Capture;
 use vulkano::{
-    image::{AllocateImageError, Image, ImageCreateInfo, ImageUsage},
-    memory::allocator::MemoryTypeFilter,
-    sync::GpuFuture,
-    Validated,
+    buffer::{Buffer, BufferCreateInfo, BufferUsage},
+    command_buffer::{
+        allocator::{
+            CommandBufferAllocator, StandardCommandBufferAllocator,
+            StandardCommandBufferAllocatorCreateInfo,
+        },
+        AutoCommandBufferBuilder, BlitImageInfo, ClearColorImageInfo, CommandBufferBeginInfo,
+        CommandBufferLevel, CommandBufferSubmitInfo, CommandBufferUsage, CopyBufferToImageInfo,
+        CopyImageInfo, ImageBlit, PrimaryCommandBufferAbstract, RecordingCommandBuffer,
+        SemaphoreSubmitInfo, SubmitInfo,
+    },
+    descriptor_set::allocator::{
+        StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo,
+    },
+    device::Queue,
+    format,
+    image::{
+        AllocateImageError, Image, ImageAspects, ImageCreateInfo, ImageLayout,
+        ImageSubresourceRange, ImageUsage,
+    },
+    memory::allocator::{
+        AllocationCreateInfo, MemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator,
+    },
+    pipeline::cache::{PipelineCache, PipelineCacheCreateInfo},
+    swapchain::{
+        AcquireNextImageInfo, AcquiredImage, PresentInfo, SemaphorePresentInfo, Surface,
+        SurfaceInfo, Swapchain, SwapchainPresentInfo,
+    },
+    sync::{
+        fence::FenceCreateInfo,
+        semaphore::{self, SemaphoreCreateInfo},
+        AccessFlags, DependencyInfo, GpuFuture, ImageMemoryBarrier, PipelineStages,
+    },
+    Validated, VulkanObject,
 };
 use vulkano_shaders;
 use xdg::BaseDirectories;
@@ -51,18 +89,6 @@ fn find_index_camera() -> Result<std::path::PathBuf> {
 
 static SPLASH_IMAGE: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/splash.png"));
 
-fn first_run(xdg: &BaseDirectories) -> Result<()> {
-    const DEFAULT_CONFIG: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/index_camera_passthrough.toml"
-    ));
-    let config = xdg.place_config_file("index_camera_passthrough.toml")?;
-    if !config.exists() {
-        std::fs::write(&config, DEFAULT_CONFIG)?;
-    }
-    Ok(())
-}
-
 fn create_submittable_image(
     device: Arc<vulkano::device::Device>,
 ) -> Result<Arc<Image>, Validated<AllocateImageError>> {
@@ -70,7 +96,7 @@ fn create_submittable_image(
     device.new_image(
         ImageCreateInfo {
             extent: [CAMERA_SIZE * 2, CAMERA_SIZE, 1],
-            format: vulkano::format::Format::R8G8B8A8_UNORM,
+            format: format::Format::R8G8B8A8_UNORM,
             usage: ImageUsage::TRANSFER_DST
                 | ImageUsage::SAMPLED
                 | ImageUsage::COLOR_ATTACHMENT
@@ -82,188 +108,280 @@ fn create_submittable_image(
     )
 }
 
-struct FrameInfo {
-    frame: Vec<u8>,
-    frame_time: Option<std::time::Instant>,
-    bypass_pipeline: bool,
+struct FrameInfo<I> {
+    frame: I,
+    frame_time: std::time::Instant,
 }
 
-fn load_splash() -> Result<Vec<u8>> {
+fn load_splash(
+    allocator: Arc<dyn MemoryAllocator>,
+    cmdbuf_allocator: Arc<dyn CommandBufferAllocator>,
+    queue: Arc<Queue>,
+    pp: &pipeline::Pipeline,
+) -> Result<Arc<vulkano::image::Image>> {
     log::debug!("loading splash");
     let img = image::load_from_memory_with_format(SPLASH_IMAGE, image::ImageFormat::Png)?
         .into_rgba8()
         .into_raw();
 
     log::debug!("splash loaded");
-    Ok(img)
+    let vkimg = pp.allocate_image()?;
+    let mut cmdbuf = AutoCommandBufferBuilder::primary(
+        cmdbuf_allocator,
+        queue.queue_family_index(),
+        CommandBufferUsage::OneTimeSubmit,
+    )?;
+    let buffer = Buffer::new_unsized::<[u8]>(
+        allocator,
+        BufferCreateInfo {
+            usage: BufferUsage::TRANSFER_SRC,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE
+                | MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        },
+        img.len() as _,
+    )?;
+    buffer.write()?.copy_from_slice(&img);
+    cmdbuf.copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(buffer, vkimg.clone()))?;
+    cmdbuf
+        .build()?
+        .execute(queue.clone())?
+        .then_signal_fence()
+        .wait(None)?;
+
+    Ok(vkimg)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-enum State {
-    Running,
-    Capturing,
-    Stopping,
+struct App {
+    swapchain: Arc<Swapchain>,
+    images: Vec<Arc<Image>>,
+    format: format::Format,
+    device: Arc<vulkano::device::Device>,
+    surface: Arc<Surface>,
+    cmdbuf_allocator: Arc<dyn CommandBufferAllocator>,
+    queue: Arc<Queue>,
+    size: PhysicalSize<u32>,
+    camera: camera::CameraThread<pipeline::Pipeline>,
+    instance_fn: ash::InstanceFnV1_0,
 }
-
-struct AppState {
-    state: Mutex<State>,
-    notify: std::sync::Condvar,
-}
-
-impl AppState {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(State::Running),
-            notify: std::sync::Condvar::new(),
-        }
-    }
-    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
-        self.state.lock().unwrap()
-    }
-    fn wait_while<'a, F>(
-        &'a self,
-        guard: std::sync::MutexGuard<'a, State>,
-        f: F,
-    ) -> std::sync::MutexGuard<'a, State>
-    where
-        F: FnMut(&mut State) -> bool,
-    {
-        self.notify.wait_while(guard, f).unwrap()
-    }
-    fn stop(&self) {
-        *self.state.lock().unwrap() = State::Stopping;
-        self.notify.notify_all();
-    }
-    fn start_capture(&self) {
-        let mut state = self.state.lock().unwrap();
-        if *state != State::Stopping {
-            *state = State::Capturing;
-        }
-        self.notify.notify_all();
-    }
-    fn stop_capture(&self) {
-        let mut state = self.state.lock().unwrap();
-        if *state != State::Stopping {
-            *state = State::Running;
-        }
-    }
-}
-
-struct CameraThread {
-    notify_new_frame: Arc<std::sync::Condvar>,
-    state: Arc<AppState>,
-    frame: Arc<Mutex<Option<FrameInfo>>>,
-    camera: v4l::Device,
-}
-
-impl CameraThread {
-    fn run(self) -> Result<()> {
-        let Self {
-            notify_new_frame,
-            state,
-            frame,
-            camera,
-        } = self;
-
-        let mut first_frame_time = None;
-        // We want to make the latency as low as possible, so only set a single buffer.
-        let mut video_stream =
-            v4l::prelude::MmapStream::with_buffers(&camera, v4l::buffer::Type::VideoCapture, 1)
-                .context("cannot open camera mmap stream")?;
-        loop {
-            {
-                let guard = state.lock();
-                log::trace!("state: {:?}", *guard);
-                if *state.wait_while(guard, |state| *state == State::Running) == State::Stopping {
-                    break;
+impl App {
+    fn redraw(&mut self) -> Result<()> {
+        let semaphore = Arc::new(vulkano::sync::semaphore::Semaphore::new(
+            self.device.clone(),
+            SemaphoreCreateInfo::default(),
+        )?);
+        let image_index = loop {
+            match unsafe {
+                self.swapchain.acquire_next_image(&AcquireNextImageInfo {
+                    semaphore: Some(semaphore.clone()),
+                    ..Default::default()
+                })
+            } {
+                Ok(AcquiredImage {
+                    image_index,
+                    is_suboptimal: false,
+                }) => break image_index,
+                Ok(AcquiredImage {
+                    is_suboptimal: true,
+                    ..
+                })
+                | Err(vulkano::Validated::Error(vulkano::VulkanError::OutOfDate)) => {
+                    (self.swapchain, self.images) = vulkano::swapchain::Swapchain::new(
+                        self.device.clone(),
+                        self.surface.clone(),
+                        vulkano::swapchain::SwapchainCreateInfo {
+                            min_image_count: 2,
+                            image_format: self.format,
+                            image_extent: self.size.into(),
+                            image_usage: vulkano::image::ImageUsage::COLOR_ATTACHMENT,
+                            composite_alpha: vulkano::swapchain::CompositeAlpha::Opaque,
+                            present_mode: vulkano::swapchain::PresentMode::Fifo,
+                            ..Default::default()
+                        },
+                    )?;
+                    continue;
                 }
-            }
-            log::trace!("getting camera frame");
-            let (frame_data, metadata) = v4l::io::traits::CaptureStream::next(&mut video_stream)?;
-            let frame_time = if let Some((camera_reference, reference)) = first_frame_time {
-                let camera_elapsed =
-                    std::time::Duration::from(metadata.timestamp) - camera_reference;
-                reference + camera_elapsed
-            } else {
-                let now = std::time::Instant::now();
-                first_frame_time = Some((metadata.timestamp.into(), now));
-                now
+                Err(e) => return Err(e.into()),
             };
-            log::trace!("got camera frame {:?}", frame_time);
-            let mut frame = frame.lock().unwrap();
-            if let Some(frame) = &mut *frame {
-                frame.frame.resize(frame_data.len(), 0);
-                frame.frame.copy_from_slice(frame_data);
-                frame.frame_time = Some(frame_time);
-                frame.bypass_pipeline = false;
-            } else {
-                *frame = Some(FrameInfo {
-                    frame: frame_data.to_vec(),
-                    frame_time: Some(frame_time),
-                    bypass_pipeline: false,
-                });
-            }
-            // log::debug!("got camera frame {}", frame_data.len());
-            notify_new_frame.notify_all();
+        };
+        let mut cmdbuf = RecordingCommandBuffer::new(
+            self.cmdbuf_allocator.clone(),
+            self.queue.queue_family_index(),
+            CommandBufferLevel::Primary,
+            CommandBufferBeginInfo {
+                usage: CommandBufferUsage::OneTimeSubmit,
+                ..Default::default()
+            },
+        )?;
+        let src_image = self.camera.with_frame(|f| f.frame.clone());
+        let dst_image = self.images[image_index as usize].clone();
+        let [w, h, _] = src_image.extent();
+        let [dw, dh, _] = dst_image.extent();
+        let aspect_ratio = w as f64 / h as f64;
+        let (mut target_w, mut target_h) = (dh as f64 * aspect_ratio, dh as f64);
+        if target_w > dw as _ {
+            target_w = dw as _;
+            target_h = target_w / aspect_ratio;
         }
+        let crop_x = (dw as f64 - target_w).max(0.) / 2.0;
+        let crop_y = (dh as f64 - target_h).max(0.) / 2.0;
+
+        let cmdbuf = unsafe {
+            cmdbuf
+                .pipeline_barrier(&DependencyInfo {
+                    image_memory_barriers: smallvec![ImageMemoryBarrier {
+                        src_stages: PipelineStages::TOP_OF_PIPE,
+                        dst_stages: PipelineStages::TOP_OF_PIPE,
+                        old_layout: ImageLayout::Undefined,
+                        new_layout: ImageLayout::TransferDstOptimal,
+                        subresource_range: dst_image.subresource_range(),
+                        ..ImageMemoryBarrier::image(dst_image.clone())
+                    }],
+                    ..Default::default()
+                })?
+                .clear_color_image(&ClearColorImageInfo::image(dst_image.clone()))?
+                .blit_image(&BlitImageInfo {
+                    src_image_layout: ImageLayout::TransferSrcOptimal,
+                    dst_image_layout: ImageLayout::TransferDstOptimal,
+                    filter: vulkano::image::sampler::Filter::Linear,
+                    regions: smallvec![ImageBlit {
+                        src_offsets: [[0, 0, 0], src_image.extent(),],
+                        src_subresource: src_image.subresource_layers(),
+                        dst_offsets: [
+                            [crop_x as u32, crop_y as u32, 0],
+                            [(crop_x + target_w) as u32, (crop_y + target_h) as u32, 1]
+                        ],
+                        dst_subresource: dst_image.subresource_layers(),
+                        ..Default::default()
+                    }],
+                    ..BlitImageInfo::images(src_image.clone(), dst_image.clone())
+                })?
+                .pipeline_barrier(&DependencyInfo {
+                    image_memory_barriers: smallvec![ImageMemoryBarrier {
+                        src_stages: PipelineStages::BOTTOM_OF_PIPE,
+                        dst_stages: PipelineStages::BOTTOM_OF_PIPE,
+                        old_layout: ImageLayout::TransferDstOptimal,
+                        new_layout: ImageLayout::PresentSrc,
+                        ..ImageMemoryBarrier::image(dst_image.clone())
+                    }],
+                    ..Default::default()
+                })?;
+            cmdbuf.end()?
+        };
+        let semaphore = self.queue.with(|mut q| unsafe {
+            let device = ash::Device::load(&self.instance_fn, self.device.handle());
+            let semaphore2 = vulkano::sync::semaphore::Semaphore::new(
+                self.device.clone(),
+                SemaphoreCreateInfo::default(),
+            )?;
+            device.queue_submit2(
+                self.queue.handle(),
+                &[ash::vk::SubmitInfo2::default()
+                    .wait_semaphore_infos(&[
+                        ash::vk::SemaphoreSubmitInfo::default().semaphore(semaphore.handle())
+                    ])
+                    .signal_semaphore_infos(&[
+                        ash::vk::SemaphoreSubmitInfo::default().semaphore(semaphore2.handle())
+                    ])
+                    .command_buffer_infos(&[
+                        ash::vk::CommandBufferSubmitInfo::default().command_buffer(cmdbuf.handle())
+                    ])],
+                ash::vk::Fence::null(),
+            )?;
+            Ok::<_, anyhow::Error>(q.present(&PresentInfo {
+                wait_semaphores: vec![SemaphorePresentInfo::new(semaphore2.into())],
+                swapchain_infos: vec![SwapchainPresentInfo::swapchain_image_index(
+                    self.swapchain.clone(),
+                    image_index,
+                )],
+                ..Default::default()
+            })?)
+        })?;
         Ok(())
     }
 }
-
-/// Get the next camera frame. If the next frame is not available, this function
-/// will block on `wait` until it is; unless `wait` is None, in which case it
-/// will return immediately.
-fn next_camera_frame<'a>(
-    shared_frame: &'_ Mutex<Option<FrameInfo>>,
-    maybe_frame: &'a mut Option<FrameInfo>,
-    wait: Option<&'_ std::sync::Condvar>,
-) -> Option<&'a mut FrameInfo> {
-    let mut other_frame = shared_frame.lock().unwrap();
-    let mut frame_changed = false;
-    while !frame_changed {
-        let new_frame_elapsed = other_frame.as_ref().map(|new_frame| new_frame.frame_time);
-        let current_frame_elapsed = maybe_frame
-            .as_ref()
-            .map(|current_frame| current_frame.frame_time);
-        frame_changed = new_frame_elapsed > current_frame_elapsed;
-        if frame_changed {
-            std::mem::swap(maybe_frame, &mut *other_frame);
-            log::trace!("frame changed");
-        } else if let Some(wait) = wait {
-            other_frame = wait.wait(other_frame).unwrap();
-        } else {
-            break;
+impl winit::application::ApplicationHandler for App {
+    fn resumed(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {}
+    fn window_event(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        _window_id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(size) => self.size = size,
+            WindowEvent::RedrawRequested => {
+                let Err(e) = self.redraw() else { return };
+                log::warn!("Failed to redraw {e}");
+                event_loop.exit();
+            }
+            _ => (),
         }
     }
-    drop(other_frame);
-    if maybe_frame.is_none() {
-        // This should never happen, because we should at least have the splash screen
-        log::error!("No frame");
-    }
-    if frame_changed {
-        Some(maybe_frame.as_mut().unwrap())
-    } else {
-        None
+    fn user_event(&mut self, event_loop: &winit::event_loop::ActiveEventLoop, (): ()) {
+        event_loop.exit();
     }
 }
-
-#[cfg(non_existent)]
 fn main() -> Result<()> {
-    let xdg = xdg::BaseDirectories::with_prefix("index_camera_passthrough")?;
-    first_run(&xdg)?;
-
-    let cfg = config::load_config(&xdg)?;
-    let env =
-        env_logger::Env::default().default_filter_or(if cfg.debug { "debug" } else { "info" });
+    let env = env_logger::Env::default().default_filter_or("info");
     env_logger::Builder::from_env(env)
         .format_timestamp_millis()
         .init();
-    let camera = v4l::Device::with_path(if cfg.camera_device.is_empty() {
-        find_index_camera()?
-    } else {
-        std::path::Path::new(&cfg.camera_device).to_owned()
-    })
-    .context("cannot open camera device")?;
+    let event_loop = EventLoop::new()?;
+    let window = WindowBuilder::new()
+        .build(&event_loop)
+        .expect("Failed to create window");
+    let required_extensions = vulkano::swapchain::Surface::required_extensions(&event_loop)?;
+    let xr = xr::OpenXr::new(required_extensions, UVec2::new(CAMERA_SIZE, CAMERA_SIZE))?;
+    let instance = xr.vk_instance();
+    let (device, queue) = xr.vk_device();
+    let surface = vulkano::swapchain::Surface::from_window(instance.clone(), &window)?;
+    let swapchain_format = device
+        .physical_device()
+        .surface_formats(
+            &surface,
+            SurfaceInfo {
+                present_mode: Some(vulkano::swapchain::PresentMode::Fifo),
+                ..Default::default()
+            },
+        )?
+        .into_iter()
+        .map(|(f, _)| f)
+        .collect::<HashSet<_>>();
+    const PREFERRED_FORMATS: &[format::Format] =
+        &[format::Format::R8G8B8_UNORM, format::Format::B8G8R8_UNORM];
+    let swapchain_format = PREFERRED_FORMATS
+        .iter()
+        .find(|f| swapchain_format.contains(f))
+        .context("cannot find a suitable format for swapchain images")?;
+    let (swapchain, images) = vulkano::swapchain::Swapchain::new(
+        device.clone(),
+        surface.clone(),
+        vulkano::swapchain::SwapchainCreateInfo {
+            min_image_count: 2,
+            image_format: *swapchain_format,
+            image_extent: window.inner_size().into(),
+            image_usage: vulkano::image::ImageUsage::TRANSFER_DST,
+            composite_alpha: vulkano::swapchain::CompositeAlpha::Opaque,
+            present_mode: vulkano::swapchain::PresentMode::Fifo,
+            ..Default::default()
+        },
+    )?;
+    let allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
+    let cmdbuf_allocator = Arc::new(StandardCommandBufferAllocator::new(
+        device.clone(),
+        StandardCommandBufferAllocatorCreateInfo::default(),
+    ));
+    let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
+        device.clone(),
+        StandardDescriptorSetAllocatorCreateInfo::default(),
+    ));
+    let camera =
+        v4l::Device::with_path(find_index_camera()?).context("cannot open camera device")?;
     if !camera
         .query_caps()?
         .capabilities
@@ -276,212 +394,80 @@ fn main() -> Result<()> {
         CAMERA_SIZE,
         v4l::FourCC::new(b"YUYV"),
     ))?;
+    let cache_file = xdg::BaseDirectories::new()?
+        .find_cache_file(std::path::Path::new("xr_passthrough").join("pipeline_cache"))
+        .and_then(|f| std::fs::read(f).ok())
+        .and_then(|data| {
+            let buf = &data[..];
+            let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(
+                &buf[..ed25519_dalek::PUBLIC_KEY_LENGTH].try_into().unwrap(),
+            )
+            .ok()?;
+            let buf = &buf[ed25519_dalek::PUBLIC_KEY_LENGTH..];
+            let signature = &ed25519_dalek::Signature::from_bytes(
+                buf[..ed25519_dalek::SIGNATURE_LENGTH].try_into().unwrap(),
+            );
+            let buf = &buf[ed25519_dalek::SIGNATURE_LENGTH..];
+
+            verifying_key.verify_strict(buf, signature).ok()?;
+            data.drain(..ed25519_dalek::PUBLIC_KEY_LENGTH + ed25519_dalek::SIGNATURE_LENGTH);
+            Some(data)
+        });
+    // SAFETY: well we validated the on disk cache with a cryptographic signature.
+    let pipeline_cache = unsafe {
+        PipelineCache::new(
+            device.clone(),
+            PipelineCacheCreateInfo {
+                initial_data: cache_file.unwrap_or_default(),
+                ..Default::default()
+            },
+        )
+    }?;
+    let camera_config = steam::find_steam_config();
     log::info!("{}", format);
+    let pp = pipeline::Pipeline::new(
+        device.clone(),
+        allocator.clone(),
+        cmdbuf_allocator.clone(),
+        queue.clone(),
+        descriptor_set_allocator.clone(),
+        true,
+        camera_config,
+        ImageLayout::TransferSrcOptimal,
+        pipeline_cache,
+        UVec2::new(CAMERA_SIZE, CAMERA_SIZE),
+        UVec2::new(CAMERA_SIZE, CAMERA_SIZE),
+    )?;
+    log::debug!("pipeline: {pp:?}");
     camera.set_params(&v4l::video::capture::Parameters::with_fps(54))?;
-    let splash = load_splash()?;
-    let frame = Arc::new(Mutex::new(Some(FrameInfo {
-        frame: splash.clone(),
-        frame_time: None,
-        bypass_pipeline: true,
-    })));
+    let splash = load_splash(
+        allocator.clone(),
+        cmdbuf_allocator.clone(),
+        queue.clone(),
+        &pp,
+    )?;
+    let camera = camera::CameraThread::new(camera, splash, pp);
 
-    let app_state = Arc::new(AppState::new());
-    let state2 = app_state.clone();
-
-    ctrlc::set_handler(move || {
-        state2.stop();
+    let proxy = event_loop.create_proxy();
+    ctrlc::set_handler({
+        move || {
+            let _ = proxy.send_event(());
+        }
     })
     .expect("Error setting Ctrl-C handler");
-
-    let notify_new_frame = Arc::new(std::sync::Condvar::new());
-    let camera_thread = CameraThread {
-        notify_new_frame: notify_new_frame.clone(),
-        frame: frame.clone(),
-        state: app_state.clone(),
-        camera,
+    // Event loop
+    let app = App {
+        swapchain,
+        images,
+        device: device.clone(),
+        size: window.inner_size(),
+        cmdbuf_allocator,
+        queue,
+        surface,
+        format: *swapchain_format,
     };
-    let camera_thread = std::thread::spawn(move || camera_thread.run());
+    event_loop.run_app(&mut app);
 
-    log::info!("{:?}", cfg.backend);
-    let mut vrsys = match cfg.backend {
-        #[cfg(feature = "openvr")]
-        Backend::OpenVR => crate::vrapi::OpenVr::new(&xdg)?.boxed(),
-        #[cfg(feature = "openxr")]
-        Backend::OpenXR => crate::vrapi::OpenXr::new(cfg.z_order)?.boxed(),
-    };
-    let instance = vrsys.vk_instance();
-    let (device, queue) = vrsys.vk_device(&instance);
-
-    // Create a VROverlay
-    vrsys.set_display_mode(config::DisplayMode::Direct)?;
-    // load camera config
-    let camera_config = if let Some(cfg) = vrsys.load_camera_paramter() {
-        Some(cfg)
-    } else if let Some(cfg) = steam::find_steam_config() {
-        // if the backend doesn't give us the parameters, we try
-        // to search in the steam config for whatever that looks
-        // like a camera parameter file
-        vrsys.set_fallback_camera_config(cfg);
-        Some(cfg)
-    } else {
-        log::warn!("No camera parameters found");
-        None
-    };
-
-    vrsys.set_position_mode(cfg.overlay.position)?;
-
-    // Show overlay
-    log::debug!("showing overlay");
-    vrsys.show_overlay()?;
-    app_state.start_capture();
-    log::debug!("waiting for ready");
-    vrsys.wait_for_ready()?;
-    log::debug!("VR runtime ready");
-
-    // TODO: don't hardcode this
-    struct AppConfig {
-        need_yuv_conversion: bool,
-    }
-    let config = AppConfig {
-        need_yuv_conversion: true,
-    };
-
-    let mut pipeline = pipeline::Pipeline::new(
-        device.clone(),
-        vrsys.vk_allocator(),
-        vrsys.vk_descriptor_set_allocator(),
-        config.need_yuv_conversion,
-        camera_config,
-    )?;
-
-    log::debug!("pipeline: {pipeline:?}");
-
-    let mut ui_state = events::State::new(cfg.open_delay);
-    let mut debug_pressed = false;
-    let mut maybe_current_frame: Option<FrameInfo> = None;
-    let is_synchronized = vrsys.is_synchronized();
-    loop {
-        let next_frame = if ui_state.is_visible() {
-            // Try to get the next camera frame if the overlay is visible
-            next_camera_frame(
-                &frame,
-                &mut maybe_current_frame,
-                if is_synchronized {
-                    // Don't wait if we are obliged to synchronize with the VR runtime
-                    None
-                } else {
-                    Some(&notify_new_frame)
-                },
-            )
-        } else {
-            None
-        };
-
-        if let Some(current_frame) = next_frame {
-            // We try to get the pose at the time when the camera frame is captured. GetDeviceToAbsoluteTrackingPose
-            // doesn't specifically say if a negative time offset will work...
-            // also, do this as early as possible.
-            let elapsed = current_frame
-                .frame_time
-                .map(|frame_time| std::time::Instant::now() - frame_time)
-                .unwrap_or_default();
-            log::trace!("elapsed: {elapsed:?}");
-            // Allocate final image
-            log::trace!("frame bypass pipeline: {}", current_frame.bypass_pipeline);
-            // Display mode must be known before we call `get_render_texture`.
-            if current_frame.bypass_pipeline {
-                vrsys.set_display_mode(config::DisplayMode::Direct)?;
-            } else {
-                vrsys.set_display_mode(cfg.display_mode)?;
-            }
-            if let Some(output) = vrsys.get_render_texture()? {
-                if current_frame.bypass_pipeline {
-                    let future = pipeline.submit_cpu_image(
-                        &current_frame.frame,
-                        vrsys.vk_command_buffer_allocator(),
-                        &queue,
-                        output,
-                    )?;
-                    future.flush()?;
-                    future.then_signal_fence().wait(None)?;
-                } else {
-                    let future = pipeline.run(
-                        &queue,
-                        vrsys.vk_allocator(),
-                        vrsys.vk_command_buffer_allocator(),
-                        &current_frame.frame,
-                        output.clone(),
-                    )?;
-                    //println!("submission: {:?}", submission);
-                    future.flush()?; // can't use then_signal_fence_and_flush() because of a vulkano bug
-                    future.then_signal_fence().wait(None)?;
-                }
-
-                // Submit the texture
-                vrsys.submit_texture(elapsed, &pipeline.fov())?;
-            }
-        } else {
-            // If we don't have a frame, this means either the overlay is not visible, or
-            // the VR runtime is a synchronized runtime so we didn't block wait for the frame.
-            assert!(!ui_state.is_visible() || is_synchronized);
-            vrsys.refresh()?;
-        }
-
-        // Handle OpenVR events
-        #[allow(clippy::never_loop)]
-        while let Some(event) = vrsys.poll_next_event()? {
-            match event {
-                vrapi::Event::RequestExit => {
-                    log::info!("RequestExit");
-                    app_state.stop();
-                    vrsys.acknowledge_quit();
-                }
-            }
-        }
-
-        if *app_state.lock() == State::Stopping {
-            // Ctrl-C or request exit
-            break;
-        }
-
-        // Handle user inputs
-        vrsys.update_action_state()?;
-        if vrsys.get_action_state(vrapi::Action::Debug)? {
-            if !debug_pressed {
-                log::debug!("Capture next frame");
-                pipeline.capture_next_frame();
-                debug_pressed = true;
-            }
-        } else {
-            debug_pressed = false;
-        }
-        ui_state.handle(&*vrsys)?;
-        match ui_state.turn() {
-            events::Action::ShowOverlay => {
-                log::debug!("showing overlay");
-                vrsys.show_overlay()?;
-                {
-                    let mut other_frame = frame.lock().unwrap();
-                    *other_frame = Some(FrameInfo {
-                        frame: splash.clone(),
-                        frame_time: None,
-                        bypass_pipeline: true,
-                    });
-                }
-                app_state.start_capture();
-            }
-            events::Action::HideOverlay => {
-                log::debug!("hiding overlay");
-                vrsys.hide_overlay()?;
-                maybe_current_frame = None;
-                app_state.stop_capture();
-            }
-            _ => (),
-        }
-        if vrsys.get_action_state(vrapi::Action::Reposition)? {
-            vrsys.set_position_mode(cfg.overlay.position)?;
-        }
-    }
-    camera_thread.join().unwrap()?;
+    camera.exit();
     Ok(())
 }
