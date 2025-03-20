@@ -196,7 +196,10 @@ impl App {
             self.queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         )?;
-        let src_image = &self.camera.frame().frame;
+        let src_image_guard = self.camera.frame(); // this guard has to be kept around until we
+                                                   // have submitted to cmdbuf, otherwise this
+                                                   // image could be reused by the camera thread.
+        let src_image = &src_image_guard.frame;
         let dst_image = window.images[image_index as usize].clone();
         let [w, h, _] = src_image.extent();
         let [dw, dh, _] = dst_image.extent();

@@ -7,9 +7,9 @@
 // UNDISTORT: whether to apply lens undistortion.
 
 layout(binding = 0) uniform Transform {
-	mat4 mvp[2];
-	float overlayWidth;
-	vec2 eyeOffset;
+    mat4 mvp[2];
+    float overlayWidth;
+    vec2 eyeOffset;
 };
 layout(binding = 1) uniform sampler2D inputTex;
 #ifdef UNDISTORT
@@ -34,10 +34,10 @@ layout(binding = 2) uniform DistortionParameters {
 
 // 0 = left, 1 = right
 layout(location = 0) in flat uint instanceId;
-// Input coordinates -0.5 ~ 0.5
-// relative to the center of the undistorted image,
+// Input coordinates -1 ~ 1
+// relative to the center of the undistorted image for the given eye,
 // this way we align the optical center to the center of the image.
-layout(location = 1) in noperspective vec2 texCoord;
+layout(location = 1) in vec2 eyeRelativeCoord;
 
 layout(location = 0) out vec4 color;
 
@@ -46,41 +46,60 @@ layout(location = 0) out vec4 color;
 #ifdef INPUT_IS_YUYV
 // bt709 -> rgb conversion matrix
 const mat3 yuvMatrix = mat3(
-	1.164,  1.164, 1.164,
-	0.000, -0.392, 2.017,
-	1.596, -0.813, 0.000
+    1.164,  1.164, 1.164,
+    0.000, -0.392, 2.017,
+    1.596, -0.813, 0.000
 );
 
-vec4 sample_input(vec2 coord) { // `coord` in `rgb` coord system
-	coord = coord + vec2(0.5, 0.5);
+vec4 sample_pixel(vec2 coord) { // `coord` in `rgb` coord system, and not normalized
+    coord = coord + vec2(0, 0.5); // align x to the left-center of the pixel
 
-	vec2 size = vec2(textureSize(inputTex, 0));
-	vec2 tex_coord = vec2(floor(coord.x / 2.0) + 0.5, coord.y + 0.5) / size;
-	vec4 yuyv = texture(inputTex, tex_coord);
-	vec3 yuv;
-	if (mod(coord.x, 2.0) == 0) {
-		yuv = vec3(yuyv.xyw);
-	} else {
-		yuv = vec3(yuyv.zyw);
-	}
-	yuv -= vec3(0.0625, 0.5, 0.5);
-	return vec4(yuvMatrix * yuv, 1.0);
+    vec2 size = vec2(textureSize(inputTex, 0));
+    vec2 tex_coord = vec2(floor(coord.x / 2.0) + 0.5, coord.y) / size;
+    vec4 yuyv = texture(inputTex, tex_coord);
+    vec3 yuv;
+    if (mod(coord.x, 2.0) == 0) {
+        yuv = vec3(yuyv.xyw);
+    } else {
+        yuv = vec3(yuyv.zyw);
+    }
+    yuv -= vec3(0.0625, 0.5, 0.5);
+    return vec4(yuvMatrix * yuv, 1.0);
+}
+
+vec4 sample_input(vec2 coord) { // `coord` in `rgb` coord system
+    // coord is normalized, but we actually need pixel coordinates
+    coord *= textureSize(inputTex, 0) * vec2(2.0, 1.0);
+    vec2 f = fract(coord);
+    coord = floor(coord);
+    vec4 color = vec4(0.0);
+
+    // Linear intepolation
+    const vec3 offsets[4] = {
+        vec3(0.0, 0.0, (1 - f.x) * (1 - f.y)),
+        vec3(0.0, 1.0, (1 - f.x) * f.y),
+        vec3(1.0, 0.0, f.x * (1 - f.y)),
+        vec3(1.0, 1.0, f.x * f.y),
+    };
+    for (int i = 0; i < 4; i++) {
+        color += sample_pixel(coord + offsets[i].xy) * offsets[i].z;
+    }
+
+    return color;
 }
 #else
 vec4 sample_input(vec2 coord) { // `coord` in `rgb` coord system
-	vec2 size = vec2(textureSize(inputTex, 0));
-	vec2 tex_coord = coord / size;
-	vec4 rgb = texture(inputTex, tex_coord);
-	return vec4(rgb.rgb, 1.0);
+    vec4 rgb = texture(inputTex, coord);
+    return vec4(rgb.rgb, 1.0);
 }
 #endif
 
 #ifdef UNDISTORT
 vec4 undistort(vec2 coord, uint eyeIndex) {
     float texOffsetX = 0.5 * float(eyeIndex);
-    coord.x -= texOffsetX;
 
-    vec2 r = coord * scale[eyeIndex] / focal[eyeIndex];
+    // coord.y *= -1 ??
+    vec2 r = coord * scale[eyeIndex] / focal[eyeIndex] / 2.0;
     // Also scale the r so the whole circular region will be included
     // in the output.
     float theta = atan(length(r));
@@ -100,27 +119,20 @@ vec4 undistort(vec2 coord, uint eyeIndex) {
     // mapped is now 0 ~ 1
     // scale x by 0.5 because inputTex is 2 image side by side
     mapped.x *= 0.5;
+    mapped.x += texOffsetX;
     // mapped is now (0~0.5, 0~1.0);
 
-    return sample_input(mapped + vec2(texOffsetX, 0.0));
+    return sample_input(mapped);
 }
 #else
 vec4 undistort(vec2 coord, float texOffsetX) {
-    return sample_input(coord + vec2(0.5 * float(instanceId), 0.0));
+    return sample_input(coord * vec2(0.25, 1.0) // (-1, 1) -> (-0.25, 0.25)
+                              + vec2(0.25, 0) // (-0.25, 0.25) -> (0, 0.5)
+                              + vec2(0.5 * float(instanceId), 0.0) // move by 0.5 to the correct eye
+                       );
 }
 #endif
 
 void main() {
-	// Perspective divide here, if we do this in vertex
-	// shader the texCoord won't be interpolated correctly
-	// because of perspective.
-	vec2 tex_coord = texCoord + vec2(0.25, 0.5);
-
-	if (tex_coord.x < 0 || tex_coord.x > 0.5) {
-		color = vec4(0.0, 0.0, 0.0, 0.0);
-	} else {
-		tex_coord = tex_coord;
-		tex_coord.y = 1.0 - tex_coord.y;
-		color = undistort(tex_coord, instanceId);
-	}
+    color = undistort(eyeRelativeCoord, instanceId);
 }

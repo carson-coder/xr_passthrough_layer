@@ -11,13 +11,14 @@ use log::{info, trace};
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
-        allocator::CommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferExecFuture,
-        CommandBufferUsage, CopyBufferToImageInfo, PrimaryCommandBufferAbstract,
-        RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo,
+        allocator::CommandBufferAllocator, AutoCommandBufferBuilder, ClearColorImageInfo,
+        CommandBufferExecFuture, CommandBufferUsage, CopyBufferToImageInfo,
+        PrimaryCommandBufferAbstract, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents,
+        SubpassEndInfo,
     },
     descriptor_set::{allocator::DescriptorSetAllocator, DescriptorSet, WriteDescriptorSet},
     device::{Device, Queue},
-    format::{Format, FormatFeatures},
+    format::{ClearColorValue, Format, FormatFeatures},
     image::{
         sampler::{
             ycbcr::{
@@ -178,8 +179,6 @@ impl StereoUndistortParams {
 struct Vertex {
     #[format(R32G32_SFLOAT)]
     position: [f32; 2],
-    #[format(R32G32_SFLOAT)]
-    in_texCoord: [f32; 2],
 }
 
 pub struct Pipeline {
@@ -402,7 +401,7 @@ impl Pipeline {
                 viewport_state: Some(ViewportState {
                     viewports: smallvec![Viewport {
                         offset: [0., 0.],
-                        extent: *render_size.as_vec2().as_ref(),
+                        extent: [(render_size.x * 2) as _, render_size.y as _],
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -447,19 +446,15 @@ impl Pipeline {
                 // Left eye quad
                 Vertex {
                     position: [-1.0, -1.0],
-                    in_texCoord: [-0.5, -0.5],
                 },
                 Vertex {
                     position: [-1.0, 1.0],
-                    in_texCoord: [-0.5, 0.5],
                 },
                 Vertex {
                     position: [0.0, 1.0],
-                    in_texCoord: [0., 0.5],
                 },
                 Vertex {
                     position: [0.0, -1.0],
-                    in_texCoord: [0., -0.5],
                 },
             ]
             .iter()
@@ -523,7 +518,7 @@ impl PostprocessPipeline for Pipeline {
         let framebuffer = Framebuffer::new(
             self.render_pass.clone(),
             vulkano::render_pass::FramebufferCreateInfo {
-                attachments: vec![ImageView::new(output, ivci)?],
+                attachments: vec![ImageView::new(output.clone(), ivci)?],
                 ..Default::default()
             },
         )?;
@@ -614,14 +609,13 @@ mod vs {
         ty: "vertex",
         src: "#version 450
 layout(location = 0) in vec2 position;
-layout(location = 2) in vec2 in_texCoord;
 layout(location = 0) out flat uint instanceId;
-layout(location = 1) out vec2 texCoord;
+layout(location = 1) out vec2 eyeRelativeCoord;
 
 void main() {
     gl_Position = vec4(position, 0, 1) + vec4(1.0, 0.0, 0.0, 0.0) * float(gl_InstanceIndex);
     instanceId = gl_InstanceIndex;
-    texCoord = in_texCoord;
+    eyeRelativeCoord = position * vec2(2.0, 1.0) + vec2(1.0, 0);
 }"
     }
 }
