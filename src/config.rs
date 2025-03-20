@@ -1,4 +1,3 @@
-use nalgebra::{matrix, Affine3, Matrix4, TCategory};
 use serde::{Deserialize, Serialize};
 
 /// Because your eye and the camera is at different physical locations, it is impossible

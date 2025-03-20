@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports)] // remove after i clean this up
 use anyhow::{anyhow, Context, Result};
 use glam::UVec2;
 use itertools::Itertools;
@@ -28,7 +29,7 @@ fn get_vulkan_library() -> &'static Arc<vulkano::VulkanLibrary> {
     VULKAN_LIBRARY.get_or_init(|| vulkano::VulkanLibrary::new().unwrap())
 }
 
-pub(crate) struct OpenXr {
+pub struct OpenXr {
     instance: openxr::Instance,
 
     session_state: openxr::SessionState,
@@ -114,7 +115,8 @@ impl OpenXr {
         };
         let raw_extensions = extensions
             .into_iter()
-            .filter_map(|(name, enabled)| enabled.then(|| std::ffi::CString::new(name).unwrap()))
+            .filter(|&(_, enabled)| enabled)
+            .map(|(name, _)| std::ffi::CString::new(name).unwrap())
             .collect::<Vec<_>>();
         let raw_extensions = raw_extensions
             .iter()
@@ -186,7 +188,10 @@ impl OpenXr {
         let vulkano_create_info = vulkano::instance::InstanceCreateInfo {
             max_api_version: Some(vk_version),
             enabled_extensions: vk_instance_extensions,
-            // enabled_layers: vec!["VK_LAYER_KHRONOS_validation".to_owned()],
+            enabled_layers: vec![
+                "VK_LAYER_KHRONOS_validation".to_owned(),
+                //                "VK_LAYER_LUNARG_gfxreconstruct".to_owned(),
+            ],
             ..Default::default()
         };
         let extensions = vk_instance_extensions
@@ -200,16 +205,17 @@ impl OpenXr {
             .collect::<Vec<_>>();
         let application_info =
             ash::vk::ApplicationInfo::default().api_version(vk_version.try_into().unwrap());
-        let create_info = ash::vk::InstanceCreateInfo::default()
-            .enabled_extension_names(&extensions)
-            .application_info(&application_info)
-            //.enabled_layer_names(&[b"VK_LAYER_KHRONOS_validation\0".as_ptr() as _])
-            ;
         let instance = unsafe {
             xr_instance.create_vulkan_instance(
                 xr_system,
                 get_instance_proc_addr,
-                (&create_info) as *const _ as _,
+                (&ash::vk::InstanceCreateInfo::default()
+                    .enabled_extension_names(&extensions)
+                    .application_info(&application_info)
+                    .enabled_layer_names(&[
+                        c"VK_LAYER_KHRONOS_validation".as_ptr(),
+                        //                        c"VK_LAYER_LUNARG_gfxreconstruct".as_ptr(),
+                    ])) as *const _ as _,
             )?
         }
         .map_err(ash::vk::Result::from_raw)?;
@@ -279,9 +285,11 @@ impl OpenXr {
     }
 
     /// render_size: Resolution of the swapchain image for a *single* eye.
-    pub(crate) fn new(
+    pub fn new(
         vk_instance_extensions: VkInstanceExtensions,
         render_size: UVec2,
+        app_name: &str,
+        app_version: u32,
     ) -> Result<Self> {
         let entry = unsafe { openxr::Entry::load()? };
         let mut extension = openxr::ExtensionSet::default();
@@ -290,8 +298,8 @@ impl OpenXr {
         extension.khr_convert_timespec_time = true;
         let instance = entry.create_instance(
             &ApplicationInfo {
-                application_name: crate::APP_NAME,
-                application_version: crate::APP_VERSION,
+                application_name: app_name,
+                application_version: app_version,
                 api_version: openxr::Version::new(1, 1, 0),
                 engine_name: "engine",
                 engine_version: 0,
@@ -304,8 +312,8 @@ impl OpenXr {
             system,
             openxr::ViewConfigurationType::PRIMARY_STEREO,
         )?;
-        if !blend_modes.contains(&openxr::EnvironmentBlendMode::ALPHA_BLEND) {
-            return Err(anyhow!("OpenXR runtime doesn't support alpha blending"));
+        if !blend_modes.contains(&openxr::EnvironmentBlendMode::OPAQUE) {
+            return Err(anyhow!("OpenXR runtime doesn't support opaque blend mode"));
         }
         let vk_instance = Self::create_vk_instance(vk_instance_extensions, &instance, system)?;
         let (device, queue) = Self::create_vk_device(&instance, system, &vk_instance)?;

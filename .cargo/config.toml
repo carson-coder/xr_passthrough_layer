@@ -1,0 +1,2 @@
+[build]
+rustflags = [ "-Cforce-frame-pointers=yes" ]#, "-Zsanitizer=address", "-Zexternal-clangrt", "-Clink-arg=-lasan" ]

@@ -3,7 +3,7 @@ use glam::{
     IVec2, UVec2,
 };
 use smallvec::smallvec;
-use std::sync::Arc;
+use std::{cell::RefCell, sync::Arc};
 
 use crate::{steam::StereoCamera, utils::DeviceExt as _};
 use anyhow::Result;
@@ -38,6 +38,7 @@ use vulkano::{
         graphics::{
             color_blend::ColorBlendState,
             input_assembly::{InputAssemblyState, PrimitiveTopology},
+            rasterization::RasterizationState,
             vertex_input::{self, Vertex as _, VertexDefinition},
             viewport::{Viewport, ViewportState},
             GraphicsPipelineCreateInfo,
@@ -172,20 +173,18 @@ impl StereoUndistortParams {
 }
 
 #[derive(vertex_input::Vertex, Default, Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[allow(non_snake_case)]
 #[repr(C)]
 struct Vertex {
     #[format(R32G32_SFLOAT)]
     position: [f32; 2],
     #[format(R32G32_SFLOAT)]
-    in_center: [f32; 2],
-    #[format(R32G32_SFLOAT)]
-    in_tex_coord: [f32; 2],
+    in_texCoord: [f32; 2],
 }
 
-pub(crate) struct Pipeline {
+pub struct Pipeline {
     correction: Option<StereoUndistortParams>,
     capture: bool,
-    render_doc: Option<renderdoc::RenderDoc<renderdoc::V100>>,
     /// A cpu buffer for storing and uploading the input image.
     input_image_buffer: Arc<Buffer>,
     input_image_gpu: Arc<VkImage>,
@@ -194,6 +193,7 @@ pub(crate) struct Pipeline {
     allocator: Arc<dyn MemoryAllocator>,
     cmdbuf_allocator: Arc<dyn CommandBufferAllocator>,
     queue: Arc<vulkano::device::Queue>,
+    output_usage: ImageUsage,
 
     vertices: Subbuffer<[Vertex]>,
     render_size: UVec2,
@@ -209,7 +209,6 @@ impl std::fmt::Debug for Pipeline {
         f.debug_struct("Pipeline")
             .field("correction", &self.correction)
             .field("capture", &self.capture)
-            .field("render_doc", &self.render_doc)
             .field("input_texture", &self.input_image_gpu.handle().as_raw())
             .field("camera_config", &self.camera_config)
             .finish_non_exhaustive()
@@ -217,11 +216,9 @@ impl std::fmt::Debug for Pipeline {
 }
 
 pub trait PostprocessPipeline {
-    type Image;
-    type Future: GpuFuture;
-    fn allocate_image(&self) -> Result<Self::Image>;
+    fn allocate_image(&self) -> Result<Arc<VkImage>>;
     /// Postprocess the camera image, taking input from a in memory buffer.
-    fn postprocess(&self, input: &[u8], output: &Self::Image) -> Result<Self::Future>;
+    fn postprocess(&self, input: &[u8], output: Arc<VkImage>) -> Result<Box<dyn GpuFuture>>;
     // /// Postprocess the camera image, taking input from a dmabuf file descriptor.
     // fn postprocess_dmabuf(&self, input: OwnedFd, output: &Self::Image) -> Result<Self::Future>;
 }
@@ -245,7 +242,7 @@ impl Pipeline {
 
     /// Create post-processing stages
     /// The camera image is two `size` images stitched together side-by-side.
-    pub(crate) fn new(
+    pub fn new(
         device: Arc<Device>,
         allocator: Arc<dyn MemoryAllocator>,
         cmdbuf_allocator: Arc<dyn CommandBufferAllocator>,
@@ -254,14 +251,11 @@ impl Pipeline {
         source_is_yuyv: bool,
         camera_config: Option<StereoCamera>,
         final_layout: ImageLayout,
+        output_usage: ImageUsage,
         pipeline_cache: Arc<PipelineCache>,
         camera_size: UVec2,
         render_size: UVec2,
     ) -> Result<Self> {
-        let render_doc = renderdoc::RenderDoc::new().ok();
-        if render_doc.is_some() {
-            log::info!("RenderDoc loaded");
-        }
         let exts = device.enabled_extensions();
         let feats = device.enabled_features();
         let has_yuyv_sampler =
@@ -402,7 +396,7 @@ impl Pipeline {
                 vertex_input_state: Some(Vertex::per_vertex().definition(&vs_main)?),
                 stages,
                 input_assembly_state: Some(InputAssemblyState {
-                    topology: PrimitiveTopology::TriangleList,
+                    topology: PrimitiveTopology::TriangleFan,
                     ..Default::default()
                 }),
                 viewport_state: Some(ViewportState {
@@ -419,6 +413,7 @@ impl Pipeline {
                     1,
                     Default::default(),
                 )),
+                rasterization_state: Some(RasterizationState::default()),
                 ..GraphicsPipelineCreateInfo::layout(layout)
             },
         )?;
@@ -449,35 +444,22 @@ impl Pipeline {
                 ..Default::default()
             },
             [
+                // Left eye quad
                 Vertex {
                     position: [-1.0, -1.0],
-                    in_tex_coord: [-0.5, -0.5],
-                    in_center: [-0.25, 0.],
+                    in_texCoord: [-0.5, -0.5],
                 },
                 Vertex {
                     position: [-1.0, 1.0],
-                    in_tex_coord: [-0.5, 0.5],
-                    in_center: [-0.25, 0.],
-                },
-                Vertex {
-                    position: [0.0, -1.0],
-                    in_tex_coord: [0., -0.5],
-                    in_center: [-0.25, 0.],
-                },
-                Vertex {
-                    position: [0.0, -1.0],
-                    in_tex_coord: [0., -0.5],
-                    in_center: [0.25, 0.],
-                },
-                Vertex {
-                    position: [-1.0, 1.0],
-                    in_tex_coord: [-0.5, 0.5],
-                    in_center: [0.25, 0.],
+                    in_texCoord: [-0.5, 0.5],
                 },
                 Vertex {
                     position: [0.0, 1.0],
-                    in_tex_coord: [0., 0.5],
-                    in_center: [0.25, 0.],
+                    in_texCoord: [0., 0.5],
+                },
+                Vertex {
+                    position: [0.0, -1.0],
+                    in_texCoord: [0., -0.5],
                 },
             ]
             .iter()
@@ -495,7 +477,7 @@ impl Pipeline {
         Ok(Self {
             correction,
             capture: false,
-            render_doc,
+            output_usage,
             camera_config,
             size: camera_size,
             vertices,
@@ -519,21 +501,16 @@ impl Pipeline {
 }
 
 impl PostprocessPipeline for Pipeline {
-    type Image = Arc<VkImage>;
-    type Future = CommandBufferExecFuture<NowFuture>;
-    fn allocate_image(&self) -> Result<Self::Image> {
-        Ok(VkImage::new(
-            self.allocator.clone(),
+    fn allocate_image(&self) -> Result<Arc<VkImage>> {
+        Ok(self.allocator.device().clone().new_image(
             ImageCreateInfo {
-                extent: [self.render_size.x as _, self.render_size.y as _, 1],
-                format: vulkano::format::Format::R8G8B8A8_SNORM,
-                usage: ImageUsage::TRANSFER_DST
-                    | ImageUsage::SAMPLED
-                    | ImageUsage::COLOR_ATTACHMENT,
+                extent: [self.render_size.x * 2, self.render_size.y, 1],
+                format: vulkano::format::Format::R8G8B8A8_UNORM,
+                usage: self.output_usage | ImageUsage::COLOR_ATTACHMENT,
                 mip_levels: 1,
                 ..Default::default()
             },
-            AllocationCreateInfo::default(),
+            MemoryTypeFilter::PREFER_DEVICE,
         )?)
     }
     /// Run the pipeline
@@ -541,14 +518,12 @@ impl PostprocessPipeline for Pipeline {
     /// # Arguments
     ///
     /// - time: Time offset into the past when the camera frame is captured
-    fn postprocess(&self, input: &[u8], output: &Self::Image) -> Result<Self::Future> {
+    fn postprocess(&self, input: &[u8], output: Arc<VkImage>) -> Result<Box<dyn GpuFuture>> {
+        let ivci = ImageViewCreateInfo::from_image(&output);
         let framebuffer = Framebuffer::new(
             self.render_pass.clone(),
             vulkano::render_pass::FramebufferCreateInfo {
-                attachments: vec![ImageView::new(
-                    output.clone(),
-                    ImageViewCreateInfo::from_image(output),
-                )?],
+                attachments: vec![ImageView::new(output, ivci)?],
                 ..Default::default()
             },
         )?;
@@ -585,10 +560,11 @@ impl PostprocessPipeline for Pipeline {
                 self.desc_set.clone(),
             )?
             .bind_vertex_buffers(0, self.vertices.clone())?;
-        unsafe { cmdbuf.draw(self.vertices.len() as u32, 1, 0, 0)? }
+        unsafe { cmdbuf.draw(self.vertices.len() as u32, 2, 0, 0)? }
             .end_render_pass(SubpassEndInfo::default())?;
 
-        Ok(cmdbuf.build()?.execute(self.queue.clone())?)
+        let fut = cmdbuf.build()?.execute(self.queue.clone())?;
+        Ok(fut.boxed())
     }
 }
 
@@ -638,14 +614,13 @@ mod vs {
         ty: "vertex",
         src: "#version 450
 layout(location = 0) in vec2 position;
-layout(location = 1) in vec2 in_center;
 layout(location = 2) in vec2 in_texCoord;
-layout(location = 0) out flat vec2 center;
+layout(location = 0) out flat uint instanceId;
 layout(location = 1) out vec2 texCoord;
 
 void main() {
-    gl_Position = vec4(position, 0, 1);
-    center = in_center;
+    gl_Position = vec4(position, 0, 1) + vec4(1.0, 0.0, 0.0, 0.0) * float(gl_InstanceIndex);
+    instanceId = gl_InstanceIndex;
     texCoord = in_texCoord;
 }"
     }

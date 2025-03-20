@@ -32,12 +32,12 @@ layout(binding = 2) uniform DistortionParameters {
 };
 #endif
 
+// 0 = left, 1 = right
+layout(location = 0) in flat uint instanceId;
 // Input coordinates -0.5 ~ 0.5
 // relative to the center of the undistorted image,
 // this way we align the optical center to the center of the image.
-layout(location = 0) in noperspective vec3 texCoord;
-// 0 = left, 1 = right
-layout(location = 1) in flat uint eyeIndex;
+layout(location = 1) in noperspective vec2 texCoord;
 
 layout(location = 0) out vec4 color;
 
@@ -106,7 +106,7 @@ vec4 undistort(vec2 coord, uint eyeIndex) {
 }
 #else
 vec4 undistort(vec2 coord, float texOffsetX) {
-    return sample_input(coord + vec2(texOffsetX, 0.0));
+    return sample_input(coord + vec2(0.5 * float(instanceId), 0.0));
 }
 #endif
 
@@ -114,14 +114,13 @@ void main() {
 	// Perspective divide here, if we do this in vertex
 	// shader the texCoord won't be interpolated correctly
 	// because of perspective.
-	vec2 tex_coord = texCoord.xy / texCoord.z;
-	tex_coord = tex_coord + vec2(0.25, 0.5);
+	vec2 tex_coord = texCoord + vec2(0.25, 0.5);
 
 	if (tex_coord.x < 0 || tex_coord.x > 0.5) {
 		color = vec4(0.0, 0.0, 0.0, 0.0);
 	} else {
 		tex_coord = tex_coord;
 		tex_coord.y = 1.0 - tex_coord.y;
-		color = undistort(tex_coord, eyeIndex);
+		color = undistort(tex_coord, instanceId);
 	}
 }

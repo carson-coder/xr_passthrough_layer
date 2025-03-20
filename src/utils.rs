@@ -49,7 +49,7 @@ impl<T, const N: usize> FromIterator<T> for Array<T, N> {
     }
 }
 
-pub(crate) trait DeviceExt {
+pub trait DeviceExt {
     type HostToDeviceAllocator: MemoryAllocator;
     fn new_image(
         self: Arc<Self>,
@@ -151,7 +151,8 @@ impl DeviceExt for Device {
             false,
         )
         .map_err(|x| Validated::Error(AllocateImageError::AllocateMemory(x)))?;
-        unsafe { raw_image.bind_memory(Some(resource_memory)) }
+        raw_image
+            .bind_memory(Some(resource_memory))
             .map_err(|(x, _, _)| x.map(AllocateImageError::BindMemory))
             .map(Arc::new)
     }
@@ -169,7 +170,8 @@ impl DeviceExt for Device {
             true,
         )
         .map_err(|x| Validated::Error(AllocateBufferError::AllocateMemory(x)))?;
-        unsafe { buffer.bind_memory(resource_memory) }
+        buffer
+            .bind_memory(resource_memory)
             .map_err(|(x, _, _)| x.map(AllocateBufferError::BindMemory))
             .map(Arc::new)
     }
