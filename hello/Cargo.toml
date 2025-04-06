@@ -1,0 +1,21 @@
+[package]
+name = "hello"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+openxr.workspace = true
+xr.workspace = true
+anyhow.workspace = true
+vulkano.workspace = true
+vulkano-shaders.workspace = true
+shaderc.workspace = true
+smallvec.workspace = true
+bytemuck.workspace = true
+glam.workspace = true
+renderdoc.workspace = true
+log.workspace = true
+env_logger.workspace = true
+ctrlc.workspace = true
+winit.workspace = true
+

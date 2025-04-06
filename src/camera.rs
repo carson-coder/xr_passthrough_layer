@@ -1,17 +1,14 @@
 use std::{
-    any,
-    cell::RefCell,
-    marker::PhantomData,
-    sync::{atomic::AtomicPtr, mpsc, Arc, OnceLock},
+    sync::{mpsc, Arc},
     thread::JoinHandle,
 };
 
-use crate::pipeline::{self, PostprocessPipeline};
+use crate::pipeline::PostprocessPipeline;
 
 use super::FrameInfo;
-use anyhow::{anyhow, bail, Context};
-use arc_swap::{ArcSwap, ArcSwapOption, Guard};
-use log::warn;
+use anyhow::{anyhow, Context};
+use arc_swap::{ArcSwap, Guard};
+use log::{info as debug, warn};
 use smallvec::SmallVec;
 use vulkano::{image::Image, sync::GpuFuture};
 
@@ -25,44 +22,32 @@ enum Control {
 }
 
 pub struct CameraThread {
+    frame: Arc<ArcSwap<FrameInfo>>,
     control: mpsc::Sender<Control>,
-    frame: ArcSwap<FrameInfo>,
-}
-
-static CAMERA_THREAD: OnceLock<CameraThread> = OnceLock::new();
-
-pub fn start(
-    camera: v4l::Device,
-    splash: Arc<Image>,
-    postprocessor: Box<dyn PostprocessPipeline + Send>,
-) -> anyhow::Result<(&'static CameraThread, JoinHandle<()>)> {
-    let mut initialized = None;
-    let ret = CAMERA_THREAD.get_or_init(|| {
-        let (camera, thread) = CameraThread::new(camera, splash, postprocessor);
-        initialized = Some(thread);
-        camera
-    });
-    let Some(join) = initialized else {
-        bail!("Camera thread already started!");
-    };
-    Ok((ret, join))
+    join: JoinHandle<()>,
 }
 
 impl CameraThread {
-    fn new(
+    pub fn new(
         camera: v4l::Device,
         splash: Arc<Image>,
         postprocessor: Box<dyn PostprocessPipeline + Send>,
-    ) -> (Self, JoinHandle<()>) {
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         let frame = FrameInfo {
             frame: splash,
             frame_time: std::time::Instant::now(),
         };
-        let frame = ArcSwap::new(Arc::new(frame));
-        let thread = std::thread::spawn(move || Self::run(rx, camera, postprocessor));
-
-        (Self { frame, control: tx }, thread)
+        let frame = Arc::new(ArcSwap::new(Arc::new(frame)));
+        let join = std::thread::spawn({
+            let frame = frame.clone();
+            move || Self::run(rx, camera, postprocessor, frame)
+        });
+        Self {
+            frame,
+            join,
+            control: tx,
+        }
     }
     pub fn frame(&self) -> Guard<Arc<FrameInfo>> {
         self.frame.load()
@@ -73,15 +58,28 @@ impl CameraThread {
     pub fn resume(&self) -> anyhow::Result<()> {
         Ok(self.control.send(Control::Resume)?)
     }
-    pub fn exit(&self) -> anyhow::Result<()> {
-        Ok(self.control.send(Control::Exit)?)
+    pub fn exit(self) -> anyhow::Result<()> {
+        self.control.send(Control::Exit)?;
+        self.join.join().map_err(|e| anyhow!("{e:?}"))
     }
+
     fn run(
         control: mpsc::Receiver<Control>,
         camera: v4l::Device,
         postprocessor: Box<dyn PostprocessPipeline>,
+        frame: Arc<ArcSwap<FrameInfo>>,
     ) {
-        let Err(e) = Self::run_inner(control, camera, postprocessor) else {
+        // hold the thread until we get a go signal
+        match control.recv() {
+            Err(std::sync::mpsc::RecvError) | Ok(Control::Exit) => {
+                debug!("camera thread stopped early");
+                return;
+            }
+            Ok(Control::Resume) => (),
+            Ok(Control::Pause) => panic!("Invalid pause command"),
+        }
+        let Err(e) = Self::run_inner(control, camera, postprocessor, frame) else {
+            debug!("camera thread stopped");
             return;
         };
         warn!("Camera thread stopped: {e:#}");
@@ -90,6 +88,7 @@ impl CameraThread {
         control: mpsc::Receiver<Control>,
         camera: v4l::Device,
         postprocessor: Box<dyn PostprocessPipeline>,
+        frame: Arc<ArcSwap<FrameInfo>>,
     ) -> anyhow::Result<()> {
         let mut render_doc = renderdoc::RenderDoc::<renderdoc::V100>::new().ok();
         if render_doc.is_some() {
@@ -101,10 +100,6 @@ impl CameraThread {
             v4l::prelude::MmapStream::with_buffers(&camera, v4l::buffer::Type::VideoCapture, 1)
                 .context("cannot open camera mmap stream")?;
         let mut is_splash = true;
-        {
-            let c = control.recv()?;
-            assert_eq!(c, Control::Resume, "unexpected command {c:?}");
-        }
         const MAX_POOL_SIZE: usize = 2;
         let mut pool = SmallVec::<[Arc<FrameInfo>; 2]>::new();
 
@@ -165,7 +160,7 @@ impl CameraThread {
                     .then_signal_fence()
                     .wait(None)?;
             }
-            let old_frame = CAMERA_THREAD.get().unwrap().frame.swap(new_frame);
+            let old_frame = frame.swap(new_frame);
             // splash image isn't allocated from the pipeline, so it can't be reused.
             if !is_splash && pool.len() < MAX_POOL_SIZE {
                 pool.push(old_frame);

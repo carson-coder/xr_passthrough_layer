@@ -4,106 +4,49 @@ use winit::{event::WindowEvent, event_loop::EventLoop};
 
 use std::{collections::HashSet, sync::Arc};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 use ::xr_passthrough_layer::{
-    camera, find_index_camera, pipeline, steam, utils::DeviceExt as _, xr, CAMERA_SIZE,
+    CAMERA_SIZE, camera, find_index_camera, pipeline, steam, utils::DeviceExt as _,
 };
 use glam::UVec2;
 use v4l::video::Capture;
 use vulkano::{
-    buffer::{Buffer, BufferCreateInfo, BufferUsage},
     command_buffer::{
+        AutoCommandBufferBuilder, BlitImageInfo, ClearColorImageInfo, CommandBufferUsage,
+        ImageBlit,
         allocator::{
             CommandBufferAllocator, StandardCommandBufferAllocator,
             StandardCommandBufferAllocatorCreateInfo,
         },
-        AutoCommandBufferBuilder, BlitImageInfo, ClearColorImageInfo, CommandBufferUsage,
-        CopyBufferToImageInfo, ImageBlit, PrimaryCommandBufferAbstract,
     },
     descriptor_set::allocator::{
         StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo,
     },
-    device::Queue,
+    device::{Device, Queue},
     format,
-    image::{Image, ImageCreateInfo, ImageLayout, ImageUsage},
-    memory::allocator::{
-        AllocationCreateInfo, MemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator,
-    },
-    pipeline::cache::{PipelineCache, PipelineCacheCreateInfo},
+    image::{Image, ImageLayout, ImageUsage},
+    memory::allocator::StandardMemoryAllocator,
     swapchain::{Surface, SurfaceInfo, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo},
     sync::GpuFuture,
 };
-
 static APP_NAME: &str = "Camera\0";
 static APP_VERSION: u32 = 0;
 
-static SPLASH_IMAGE: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/splash.png"));
-
-fn load_splash(
-    device: Arc<vulkano::device::Device>,
-    allocator: Arc<dyn MemoryAllocator>,
-    cmdbuf_allocator: Arc<dyn CommandBufferAllocator>,
-    queue: Arc<Queue>,
-) -> Result<Arc<vulkano::image::Image>> {
-    log::debug!("loading splash");
-    let img =
-        image::load_from_memory_with_format(SPLASH_IMAGE, image::ImageFormat::Png)?.into_rgba8();
-    let extent = [img.width(), img.height()];
-    let img = img.into_raw();
-
-    log::debug!("splash loaded");
-    let vkimg = device.new_image(
-        ImageCreateInfo {
-            format: vulkano::format::Format::R8G8B8A8_UNORM,
-            extent: [extent[0], extent[1], 1],
-            usage: ImageUsage::TRANSFER_DST | ImageUsage::TRANSFER_SRC | ImageUsage::SAMPLED,
-            ..Default::default()
-        },
-        MemoryTypeFilter::PREFER_DEVICE,
-    )?;
-    let mut cmdbuf = AutoCommandBufferBuilder::primary(
-        cmdbuf_allocator,
-        queue.queue_family_index(),
-        CommandBufferUsage::OneTimeSubmit,
-    )?;
-    let buffer = Buffer::new_unsized::<[u8]>(
-        allocator,
-        BufferCreateInfo {
-            usage: BufferUsage::TRANSFER_SRC,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE
-                | MemoryTypeFilter::PREFER_DEVICE,
-            ..Default::default()
-        },
-        img.len() as _,
-    )?;
-    buffer.write()?.copy_from_slice(&img);
-    cmdbuf.copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(buffer, vkimg.clone()))?;
-    cmdbuf
-        .build()?
-        .execute(queue.clone())?
-        .then_signal_fence()
-        .wait(None)?;
-
-    Ok(vkimg)
-}
+static SPLASH_IMAGE: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../splash.png"));
 
 #[derive(Clone)]
 struct Window {
     swapchain: Arc<Swapchain>,
     images: Vec<Arc<Image>>,
     inner: Arc<winit::window::Window>,
-    surface: Arc<Surface>,
 }
 
 struct App {
-    device: Arc<vulkano::device::Device>,
+    device: Arc<Device>,
     cmdbuf_allocator: Arc<dyn CommandBufferAllocator>,
     queue: Arc<Queue>,
-    camera: &'static camera::CameraThread,
+    camera: camera::CameraThread,
     window: Option<Window>,
     instance: Arc<vulkano::instance::Instance>,
     previous_frame_end: Option<Box<dyn GpuFuture>>,
@@ -151,7 +94,6 @@ impl App {
         self.window = Some(Window {
             swapchain,
             images,
-            surface,
             inner: window,
         });
         //self.previous_frame_end = Some(vulkano::sync::now(self.device.clone()).boxed());
@@ -197,8 +139,8 @@ impl App {
             CommandBufferUsage::OneTimeSubmit,
         )?;
         let src_image_guard = self.camera.frame(); // this guard has to be kept around until we
-                                                   // have submitted to cmdbuf, otherwise this
-                                                   // image could be reused by the camera thread.
+        // have submitted to cmdbuf, otherwise this
+        // image could be reused by the camera thread.
         let src_image = &src_image_guard.frame;
         let dst_image = window.images[image_index as usize].clone();
         let [w, h, _] = src_image.extent();
@@ -213,7 +155,7 @@ impl App {
         let crop_y = (dh as f64 - target_h).max(0.) / 2.0;
 
         cmdbuf
-            .clear_color_image(ClearColorImageInfo::image(dst_image.clone()))?
+            .clear_color_image(ClearColorImageInfo::new(dst_image.clone()))?
             .blit_image(BlitImageInfo {
                 src_image_layout: ImageLayout::TransferSrcOptimal,
                 dst_image_layout: ImageLayout::TransferDstOptimal,
@@ -228,7 +170,7 @@ impl App {
                     dst_subresource: dst_image.subresource_layers(),
                     ..Default::default()
                 }],
-                ..BlitImageInfo::images(src_image.clone(), dst_image.clone())
+                ..BlitImageInfo::new(src_image.clone(), dst_image.clone())
             })?;
         let mut previous_future = self.previous_frame_end.take().unwrap();
         previous_future.cleanup_finished();
@@ -242,10 +184,7 @@ impl App {
             future
                 .then_swapchain_present(
                     self.queue.clone(),
-                    SwapchainPresentInfo::swapchain_image_index(
-                        window.swapchain.clone(),
-                        image_index,
-                    ),
+                    SwapchainPresentInfo::new(window.swapchain.clone(), image_index),
                 )
                 .then_signal_fence_and_flush()?
                 .boxed(),
@@ -304,9 +243,9 @@ fn main() -> Result<()> {
         .init();
     let event_loop = EventLoop::new()?;
     let required_extensions = vulkano::swapchain::Surface::required_extensions(&event_loop)?;
-    let xr = xr::OpenXr::new(
+    let (xr, _frame_waiter, _frame_stream) = xr::OpenXr::new(
         required_extensions,
-        UVec2::new(CAMERA_SIZE, CAMERA_SIZE),
+        Default::default(),
         APP_NAME,
         APP_VERSION,
     )?;
@@ -335,35 +274,10 @@ fn main() -> Result<()> {
         CAMERA_SIZE,
         v4l::FourCC::new(b"YUYV"),
     ))?;
-    let cache_file = xdg::BaseDirectories::new()?
-        .find_cache_file(std::path::Path::new("xr_passthrough").join("pipeline_cache"))
-        .and_then(|f| std::fs::read(f).ok())
-        .and_then(|mut data| {
-            let buf = &data[..];
-            let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(
-                &buf[..ed25519_dalek::PUBLIC_KEY_LENGTH].try_into().unwrap(),
-            )
-            .ok()?;
-            let buf = &buf[ed25519_dalek::PUBLIC_KEY_LENGTH..];
-            let signature = &ed25519_dalek::Signature::from_bytes(
-                buf[..ed25519_dalek::SIGNATURE_LENGTH].try_into().unwrap(),
-            );
-            let buf = &buf[ed25519_dalek::SIGNATURE_LENGTH..];
-
-            verifying_key.verify_strict(buf, signature).ok()?;
-            data.drain(..ed25519_dalek::PUBLIC_KEY_LENGTH + ed25519_dalek::SIGNATURE_LENGTH);
-            Some(data)
-        });
-    // SAFETY: well we validated the on disk cache with a cryptographic signature.
-    let pipeline_cache = unsafe {
-        PipelineCache::new(
-            device.clone(),
-            PipelineCacheCreateInfo {
-                initial_data: cache_file.unwrap_or_default(),
-                ..Default::default()
-            },
-        )
-    }?;
+    let pipeline_cache = xr_passthrough_layer::config::load_pipeline_cache(
+        device.clone(),
+        &xdg::BaseDirectories::new()?,
+    )?;
     let camera_config = steam::find_steam_config();
     log::info!("{}", format);
     let pp = pipeline::Pipeline::new(
@@ -382,14 +296,15 @@ fn main() -> Result<()> {
     )?;
     log::info!("pipeline: {pp:?}");
     camera.set_params(&v4l::video::capture::Parameters::with_fps(54))?;
-    let splash = load_splash(
+    let splash = xr_passthrough_layer::config::load_splash(
         device.clone(),
         allocator.clone(),
         cmdbuf_allocator.clone(),
         queue.clone(),
+        SPLASH_IMAGE,
     )?;
 
-    let (camera, camera_thread) = camera::start(camera, splash, Box::new(pp))?;
+    let camera = camera::CameraThread::new(camera, splash, Box::new(pp));
 
     let proxy = event_loop.create_proxy();
     ctrlc::set_handler({
@@ -412,7 +327,6 @@ fn main() -> Result<()> {
     event_loop.run_app(&mut app)?;
     log::info!("event loop exited");
 
-    camera.exit()?;
-    camera_thread.join().unwrap();
+    app.camera.exit()?;
     Ok(())
 }

@@ -24,11 +24,12 @@
           "clippy"
           "rustc"
           "cargo"
+          "miri-preview"
         ];
     in with pkgs; {
       devShells.${system}.default = mkShell {
         nativeBuildInputs =
-          [ pkg-config cmake rust-toolchain rust-analyzer-nightly cargo-bloat ];
+          [ pkg-config cmake rust-toolchain rust-analyzer-nightly cargo-bloat shaderc ];
         buildInputs = [ systemdLibs linuxHeaders openvr xorg.libxcb ];
         shellHook = ''
           export LD_LIBRARY_PATH="${
@@ -38,6 +39,10 @@
               vulkan-loader
               util-linux
               shaderc
+              libuvc
+              SDL2
+              opencv
+              openvr
               xorg.libX11
               xorg.libXcursor
               xorg.libXi

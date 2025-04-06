@@ -1,0 +1,15 @@
+[package]
+name = "xr"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+openxr.workspace = true
+vulkano.workspace = true
+itertools.workspace = true
+glam.workspace = true
+nalgebra.workspace = true
+anyhow.workspace = true
+log.workspace = true
+ash.workspace = true
+renderdoc.workspace = true

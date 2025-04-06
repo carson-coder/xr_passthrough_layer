@@ -1,2 +1,6 @@
 [build]
-rustflags = [ "-Cforce-frame-pointers=yes" ]#, "-Zsanitizer=address", "-Zexternal-clangrt", "-Clink-arg=-lasan" ]
+rustflags = [ "-Cforce-frame-pointers=yes", "-Zproc-macro-backtrace" ]#, "-Zsanitizer=address", "-Zexternal-clangrt", "-Clink-arg=-lasan" ]
+
+[patch.crates-io]
+openxr = { path = "./openxrs/openxr" }
+vulkano = { git = "https://github.com/yshui/vulkano", branch = "more-borrowing" }

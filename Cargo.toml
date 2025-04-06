@@ -6,47 +6,71 @@ repository = "https://github.com/yshui/xr_passthrough_layer"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-rust-version = "1.78"
+rust-version = "1.84"
 
 [workspace]
-members = [ "thirdparty/quark", "thirdparty/quark/proc-macros" ]
+members = [ "thirdparty/quark", "thirdparty/quark/proc-macros", "hello", "experiment" , "xrhelper"]
+
+[workspace.dependencies]
+vulkano = "0.35.0"
+vulkano-shaders = "0.35.0"
+anyhow = { version = "1.0.45", features = ["backtrace"] }
+openxr = { version = "0.19.0" }
+nalgebra = "0.33.2"
+serde = { version = "1.0.130", features = ["derive"] }
+log = "0.4.14"
+env_logger = "0.11.3"
+itertools = "0.14.0"
+v4l = "0.14.0"
+ash = "0.38.0"
+glam = "0.30.0"
+smallvec = "1.14.0"
+smallvec2 = { version = "=2.0.0-alpha.11", package = "smallvec" }
+xdg = "2.4.0"
+xr = { path = "./xrhelper" }
+shaderc = "0.8.0"
+bytemuck = { version = "^1.7", features = ["derive"] }
+renderdoc = "0.12.1"
+ctrlc = "3.4.5"
+winit = "0.30.9"
 
 [lib]
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
-anyhow = { version = "1.0.45", features = ["backtrace"] }
-ash = "0.38.0"
-vulkano = "0.35.0"
-vulkano-shaders = "0.35.0"
+anyhow.workspace = true
+vulkano.workspace = true
+vulkano-shaders.workspace = true
+openxr.workspace = true
+nalgebra.workspace = true
+serde.workspace = true
+log.workspace = true
+env_logger.workspace = true
+itertools.workspace = true
+v4l.workspace = true
+ash.workspace = true
+glam.workspace = true
+smallvec.workspace = true
+smallvec2.workspace = true
+xdg.workspace = true
+bytemuck.workspace = true
+renderdoc.workspace = true
+
 image = "0.25.1"
-ctrlc = "3.2.1"
-log = "0.4.14"
-env_logger = "0.11.3"
-v4l = "0.14.0"
+ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
 udev = "0.9.3"
 thiserror = "2.0.11"
-renderdoc = "0.12.1"
-nalgebra = "0.33.2"
-itertools = "0.14.0"
 config = "0.15.8"
-serde = { version = "1.0.130", features = ["derive"] }
 argh = "0.1.6"
 serde_json = "1.0.70"
-xdg = "2.4.0"
 toml = "0.8.8"
 humantime-serde = "1.0.1"
-bytemuck = { version = "^1.7", features = ["derive"] }
 libloading = "0.8.0"
-openxr = { version = "0.19.0" }
-smallvec = "1.11.2"
 quark = { path = "thirdparty/quark" }
-glam = "0.30.0"
-ed25519-dalek = "2.1.1"
-rand = "0.9.0"
-winit = "0.30.9"
+rand = "0.8.0"
 arc-swap = "1.7.1"
+phf = { version = "0.11.3", features = ["macros"] }
 
 [build-dependencies]
-anyhow = "1.0.45"
-shaderc = "0.8.0"
+anyhow.workspace = true
+shaderc.workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "experiment"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow.workspace = true
+v4l.workspace = true
+ash.workspace = true
+log.workspace = true
+env_logger.workspace = true
+smallvec.workspace = true
+xdg.workspace = true
+xr.workspace = true
+ctrlc.workspace = true
+winit.workspace = true
+
+xr_passthrough_layer = { path = "../" }
+vulkano.workspace = true
+glam.workspace = true
+openxr.workspace = true
