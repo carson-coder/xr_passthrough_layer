@@ -4,3 +4,6 @@ rustflags = [ "-Cforce-frame-pointers=yes", "-Zproc-macro-backtrace" ]#, "-Zsani
 [patch.crates-io]
 openxr = { path = "./openxrs/openxr" }
 vulkano = { git = "https://github.com/yshui/vulkano", branch = "more-borrowing" }
+
+[alias]
+xtask = "run --package xtask --"

@@ -9,7 +9,7 @@ license = "MIT"
 rust-version = "1.85"
 
 [workspace]
-members = [ "thirdparty/quark", "thirdparty/quark/proc-macros", "hello", "experiment" , "xrhelper"]
+members = [ "thirdparty/quark", "thirdparty/quark/proc-macros", "hello", "experiment" , "xrhelper", "xtask"]
 
 [workspace.dependencies]
 vulkano = "0.35.0"
