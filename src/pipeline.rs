@@ -1,57 +1,57 @@
 use glam::{
+    UVec2,
     f64::{DVec2 as Vec2, DVec4 as Vec4},
-    IVec2, UVec2,
 };
 use smallvec::smallvec;
-use std::{cell::RefCell, sync::Arc};
+use std::sync::Arc;
 
 use crate::{steam::StereoCamera, utils::DeviceExt as _};
 use anyhow::Result;
 use log::{info, trace};
 use vulkano::{
+    Handle, VulkanObject,
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
-        allocator::CommandBufferAllocator, AutoCommandBufferBuilder, ClearColorImageInfo,
-        CommandBufferExecFuture, CommandBufferUsage, CopyBufferToImageInfo,
-        PrimaryCommandBufferAbstract, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents,
-        SubpassEndInfo,
+        AutoCommandBufferBuilder, BlitImageInfo, CommandBufferUsage, CopyBufferToImageInfo,
+        ImageBlit, PrimaryAutoCommandBuffer, PrimaryCommandBufferAbstract as _,
+        RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo,
+        allocator::CommandBufferAllocator,
     },
-    descriptor_set::{allocator::DescriptorSetAllocator, DescriptorSet, WriteDescriptorSet},
+    descriptor_set::{DescriptorSet, WriteDescriptorSet, allocator::DescriptorSetAllocator},
     device::{Device, Queue},
-    format::{ClearColorValue, Format, FormatFeatures},
+    format::{Format, FormatFeatures},
     image::{
+        Image as VkImage, ImageCreateInfo, ImageLayout, ImageTiling, ImageUsage,
         sampler::{
+            Filter, Sampler, SamplerCreateInfo,
             ycbcr::{
                 SamplerYcbcrConversion, SamplerYcbcrConversionCreateInfo,
                 SamplerYcbcrModelConversion,
             },
-            Filter, Sampler, SamplerCreateInfo,
         },
         view::{ImageView, ImageViewCreateInfo},
-        Image as VkImage, ImageCreateInfo, ImageLayout, ImageTiling, ImageUsage,
     },
     memory::allocator::{
         AllocationCreateInfo, MemoryAllocatePreference, MemoryAllocator, MemoryTypeFilter,
     },
     padded::Padded,
     pipeline::{
+        GraphicsPipeline, Pipeline as _, PipelineBindPoint, PipelineLayout,
+        PipelineShaderStageCreateInfo,
         cache::PipelineCache,
         graphics::{
+            GraphicsPipelineCreateInfo,
             color_blend::ColorBlendState,
             input_assembly::{InputAssemblyState, PrimitiveTopology},
             rasterization::RasterizationState,
             vertex_input::{self, Vertex as _, VertexDefinition},
             viewport::{Viewport, ViewportState},
-            GraphicsPipelineCreateInfo,
         },
         layout::PipelineDescriptorSetLayoutCreateInfo,
-        GraphicsPipeline, Pipeline as _, PipelineBindPoint, PipelineLayout,
-        PipelineShaderStageCreateInfo,
     },
-    render_pass::{Framebuffer, RenderPass, Subpass},
+    render_pass::{Framebuffer, Subpass},
     shader::ShaderModule,
-    sync::{future::NowFuture, GpuFuture},
-    Handle, VulkanObject,
+    sync::{GpuFuture, future::FenceSignalFuture},
 };
 
 /// Lens distortion correction parameters for a side-by-side stereo image
@@ -133,8 +133,8 @@ impl StereoUndistortParams {
     /// # Arguments
     ///
     /// - is_final: whether this is the final stage of the pipeline.
-    ///             if true, the output image will be submitted to
-    ///             the vr compositor.
+    ///   if true, the output image will be submitted to
+    ///   the vr compositor.
     pub fn new(size: UVec2, camera_calib: &StereoCamera) -> Result<Self> {
         let size = size.as_dvec2();
         let center = [
@@ -187,20 +187,18 @@ pub struct Pipeline {
     /// A cpu buffer for storing and uploading the input image.
     input_image_buffer: Arc<Buffer>,
     input_image_gpu: Arc<VkImage>,
+    /// The input image after post-processing (e.g. undistortion, yuv to rgb conversion)
+    postprocessed_image: Arc<VkImage>,
     camera_config: Option<StereoCamera>,
-    size: UVec2,
     allocator: Arc<dyn MemoryAllocator>,
     cmdbuf_allocator: Arc<dyn CommandBufferAllocator>,
-    queue: Arc<vulkano::device::Queue>,
-    output_usage: ImageUsage,
+    device: Arc<Device>,
+    queue: Arc<Queue>,
 
-    vertices: Subbuffer<[Vertex]>,
-    render_size: UVec2,
-
-    // Vulkan states
-    desc_set: Arc<DescriptorSet>,
-    pipeline: Arc<GraphicsPipeline>,
-    render_pass: Arc<RenderPass>,
+    /// Command buffer for uploading the image to the GPU
+    cmdbuf: Arc<PrimaryAutoCommandBuffer>,
+    previous_upload_end: Option<Arc<FenceSignalFuture<Box<dyn GpuFuture + Send + Sync>>>>,
+    previous_frame_time: Option<std::time::Instant>,
 }
 
 impl std::fmt::Debug for Pipeline {
@@ -216,6 +214,9 @@ impl std::fmt::Debug for Pipeline {
 
 pub trait PostprocessPipeline {
     fn allocate_image(&self) -> Result<Arc<VkImage>>;
+    /// Create command buffers for a given set of swapchain images. If a set of command buffers
+    /// were created previously, they will be replaced.
+    fn create_command_buffers(&mut self, images: &[Arc<VkImage>], input_len: usize) -> Result<()>;
     /// Postprocess the camera image, taking input from a in memory buffer.
     fn postprocess(&self, input: &[u8], output: Arc<VkImage>) -> Result<Box<dyn GpuFuture>>;
     // /// Postprocess the camera image, taking input from a dmabuf file descriptor.
@@ -241,6 +242,7 @@ impl Pipeline {
 
     /// Create post-processing stages
     /// The camera image is two `size` images stitched together side-by-side.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: Arc<Device>,
         allocator: Arc<dyn MemoryAllocator>,
@@ -298,7 +300,16 @@ impl Pipeline {
                     | ImageUsage::COLOR_ATTACHMENT,
                 ..Default::default()
             },
-            MemoryTypeFilter::HOST_SEQUENTIAL_WRITE | MemoryTypeFilter::PREFER_DEVICE,
+            MemoryTypeFilter::PREFER_DEVICE,
+        )?;
+        let postprocessed_image = device.clone().new_image(
+            ImageCreateInfo {
+                extent: [render_size.x * 2, render_size.y, 1],
+                format: Format::R8G8B8A8_UNORM,
+                usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_DST | output_usage,
+                ..Default::default()
+            },
+            MemoryTypeFilter::PREFER_DEVICE,
         )?;
         let cpu_buffer = device.clone().new_buffer(
             BufferCreateInfo {
@@ -413,7 +424,7 @@ impl Pipeline {
                     Default::default(),
                 )),
                 rasterization_state: Some(RasterizationState::default()),
-                ..GraphicsPipelineCreateInfo::layout(layout)
+                ..GraphicsPipelineCreateInfo::new(layout)
             },
         )?;
         let desc_set_writes = [WriteDescriptorSet::image_view_sampler(
@@ -467,76 +478,22 @@ impl Pipeline {
             desc_set_writes,
             None,
         )?;
-
-        log::info!("Adjusted FOV: {:?}", fov);
-        Ok(Self {
-            correction,
-            capture: false,
-            output_usage,
-            camera_config,
-            size: camera_size,
-            vertices,
-            input_image_buffer: cpu_buffer,
-            input_image_gpu: input_texture,
-            desc_set,
-            pipeline,
-            render_pass,
-            allocator,
-            cmdbuf_allocator,
-            queue,
-            render_size,
-        })
-    }
-    pub fn fov(&self) -> [Vec2; 2] {
-        self.correction
-            .as_ref()
-            .map(|c| c.fov())
-            .unwrap_or([Vec2::new(1.19, 1.19); 2])
-    }
-}
-
-impl PostprocessPipeline for Pipeline {
-    fn allocate_image(&self) -> Result<Arc<VkImage>> {
-        Ok(self.allocator.device().clone().new_image(
-            ImageCreateInfo {
-                extent: [self.render_size.x * 2, self.render_size.y, 1],
-                format: vulkano::format::Format::R8G8B8A8_UNORM,
-                usage: self.output_usage | ImageUsage::COLOR_ATTACHMENT,
-                mip_levels: 1,
-                ..Default::default()
-            },
-            MemoryTypeFilter::PREFER_DEVICE,
-        )?)
-    }
-    /// Run the pipeline
-    ///
-    /// # Arguments
-    ///
-    /// - time: Time offset into the past when the camera frame is captured
-    fn postprocess(&self, input: &[u8], output: Arc<VkImage>) -> Result<Box<dyn GpuFuture>> {
-        let ivci = ImageViewCreateInfo::from_image(&output);
+        let buffer = Subbuffer::new(cpu_buffer.clone());
+        let ivci = ImageViewCreateInfo::from_image(&postprocessed_image);
         let framebuffer = Framebuffer::new(
-            self.render_pass.clone(),
+            render_pass.clone(),
             vulkano::render_pass::FramebufferCreateInfo {
-                attachments: vec![ImageView::new(output.clone(), ivci)?],
+                attachments: vec![ImageView::new(postprocessed_image.clone(), ivci)?],
                 ..Default::default()
             },
         )?;
         let mut cmdbuf = AutoCommandBufferBuilder::primary(
-            self.cmdbuf_allocator.clone(),
-            self.queue.queue_family_index(),
-            CommandBufferUsage::OneTimeSubmit,
+            cmdbuf_allocator.clone(),
+            queue.queue_family_index(),
+            CommandBufferUsage::MultipleSubmit,
         )?;
-
-        // 1. submit image to GPU
-        // 2. convert YUYV to RGB
-        let buffer = Subbuffer::new(self.input_image_buffer.clone()).slice(0..input.len() as u64);
-        buffer.write()?.copy_from_slice(input);
-        cmdbuf.copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(
-            buffer,
-            self.input_image_gpu.clone(),
-        ))?;
         cmdbuf
+            .copy_buffer_to_image(CopyBufferToImageInfo::new(buffer, input_texture.clone()))?
             .begin_render_pass(
                 RenderPassBeginInfo {
                     clear_values: vec![None],
@@ -547,19 +504,152 @@ impl PostprocessPipeline for Pipeline {
                     ..Default::default()
                 },
             )?
-            .bind_pipeline_graphics(self.pipeline.clone())?
+            .bind_pipeline_graphics(pipeline.clone())?
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
-                self.pipeline.layout().clone(),
+                pipeline.layout().clone(),
                 0,
-                self.desc_set.clone(),
+                desc_set.clone(),
             )?
-            .bind_vertex_buffers(0, self.vertices.clone())?;
-        unsafe { cmdbuf.draw(self.vertices.len() as u32, 2, 0, 0)? }
+            .bind_vertex_buffers(0, vertices.clone())?;
+        unsafe { cmdbuf.draw(vertices.len() as u32, 2, 0, 0)? }
             .end_render_pass(SubpassEndInfo::default())?;
+        let cmdbuf = cmdbuf.build()?;
 
-        let fut = cmdbuf.build()?.execute(self.queue.clone())?;
-        Ok(fut.boxed())
+        log::info!("Adjusted FOV: {:?}", fov);
+        Ok(Self {
+            correction,
+            capture: false,
+            camera_config,
+            input_image_buffer: cpu_buffer,
+            input_image_gpu: input_texture,
+            postprocessed_image,
+            previous_upload_end: None,
+            previous_frame_time: None,
+            device,
+            allocator,
+            cmdbuf,
+            cmdbuf_allocator,
+            queue,
+        })
+    }
+    pub fn fov(&self) -> [Vec2; 2] {
+        self.correction
+            .as_ref()
+            .map(|c| c.fov())
+            .unwrap_or([Vec2::new(1.19, 1.19); 2])
+    }
+    /// Run the pipeline
+    ///
+    /// # Arguments
+    ///
+    /// - time: Time offset into the past when the camera frame is captured
+    pub fn maybe_postprocess(&mut self, frame: &crate::FrameInfo) -> Result<()> {
+        if Some(frame.frame_time) == self.previous_frame_time {
+            return Ok(());
+        }
+        let mut previous_fut = self.previous_upload_end.take();
+        if let Some(f) = &mut previous_fut {
+            f.wait(None)?;
+            f.cleanup_finished();
+        }
+
+        self.previous_upload_end = Some(Arc::new(if frame.needs_postprocess {
+            {
+                let buffer = Subbuffer::new(self.input_image_buffer.clone());
+                buffer.write()?.copy_from_slice(&frame.frame);
+            }
+
+            if let Some(f) = previous_fut {
+                f.then_execute(self.queue.clone(), self.cmdbuf.clone())?
+                    .boxed_send_sync()
+                    .then_signal_fence_and_flush()?
+            } else {
+                self.cmdbuf
+                    .clone()
+                    .execute(self.queue.clone())?
+                    .boxed_send_sync()
+                    .then_signal_fence_and_flush()?
+            }
+        } else {
+            assert_eq!(
+                frame.frame.len(),
+                frame.size.x as usize * 2 * frame.size.y as usize * 4
+            );
+            let buffer = Buffer::new_slice::<u8>(
+                self.allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::TRANSFER_SRC,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE
+                        | MemoryTypeFilter::PREFER_DEVICE,
+                    allocate_preference: MemoryAllocatePreference::Unknown,
+                    ..Default::default()
+                },
+                frame.size.x as u64 * 2 * frame.size.y as u64 * 4,
+            )?;
+            buffer.write()?.copy_from_slice(&frame.frame);
+            let vkimg = self.device.clone().new_image(
+                ImageCreateInfo {
+                    format: vulkano::format::Format::R8G8B8A8_UNORM,
+                    extent: [frame.size.x * 2, frame.size.y, 1],
+                    usage: ImageUsage::TRANSFER_DST
+                        | ImageUsage::TRANSFER_SRC
+                        | ImageUsage::SAMPLED,
+                    ..Default::default()
+                },
+                MemoryTypeFilter::PREFER_DEVICE,
+            )?;
+            let mut cmdbuf = AutoCommandBufferBuilder::primary(
+                self.cmdbuf_allocator.clone(),
+                self.queue.queue_family_index(),
+                CommandBufferUsage::OneTimeSubmit,
+            )?;
+            cmdbuf
+                .copy_buffer_to_image(CopyBufferToImageInfo::new(buffer, vkimg.clone()))?
+                .blit_image(BlitImageInfo {
+                    src_image_layout: ImageLayout::TransferSrcOptimal,
+                    dst_image_layout: ImageLayout::TransferDstOptimal,
+                    filter: Filter::Linear,
+                    regions: smallvec![ImageBlit {
+                        src_subresource: vkimg.subresource_layers(),
+                        dst_subresource: self.postprocessed_image.subresource_layers(),
+                        src_offsets: [[0, 0, 0], vkimg.extent()],
+                        dst_offsets: [[0, 0, 0], self.postprocessed_image.extent()],
+                        ..Default::default()
+                    }],
+                    ..BlitImageInfo::new(vkimg, self.postprocessed_image.clone())
+                })?;
+            cmdbuf
+                .build()?
+                .execute(self.queue.clone())?
+                .boxed_send_sync()
+                .then_signal_fence_and_flush()?
+        }));
+        Ok(())
+    }
+    /// Return the post-processed image and the fence signal future to wait on for the image to be
+    /// ready.
+    ///
+    /// # Panic
+    ///
+    /// panics if `maybe_postprocess` was not called before this function.
+    pub fn image(
+        &self,
+    ) -> (
+        Arc<VkImage>,
+        Arc<FenceSignalFuture<Box<dyn GpuFuture + Send + Sync>>>,
+    ) {
+        (
+            self.postprocessed_image.clone(),
+            self.previous_upload_end.clone().unwrap(),
+        )
+    }
+
+    pub fn image_extent(&self) -> [u32; 3] {
+        self.postprocessed_image.extent()
     }
 }
 

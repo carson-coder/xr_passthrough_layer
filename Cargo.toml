@@ -4,9 +4,9 @@ description = "impl of XR_FB_passthrough as an API layer"
 authors = ["Yuxuan Shui <yshuiv7@gmail.com>"]
 repository = "https://github.com/yshui/xr_passthrough_layer"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT"
-rust-version = "1.84"
+rust-version = "1.85"
 
 [workspace]
 members = [ "thirdparty/quark", "thirdparty/quark/proc-macros", "hello", "experiment" , "xrhelper"]

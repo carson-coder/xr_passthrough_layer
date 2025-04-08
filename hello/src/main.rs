@@ -8,8 +8,8 @@ use winit::{
 
 use anyhow::{Context as _, Result};
 use openxr::{
-    EnvironmentBlendMode, Extent2Di, Offset2Di, Rect2Di, SwapchainSubImage, ViewConfigurationType,
-    sys::Handle,
+    CompositionLayerFlags, EnvironmentBlendMode, Extent2Di, FrameState, Offset2Di, Rect2Di,
+    SwapchainSubImage, ViewConfigurationType, ViewStateFlags, sys::Handle,
 };
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
@@ -85,6 +85,7 @@ impl SessionState {
             }
             SessionState::Idle(mut waiter) => {
                 let handle = std::thread::spawn(move || {
+                    log::info!("Frame waiter started");
                     loop {
                         log::debug!("Waiting for frame");
                         match waiter.wait() {
@@ -226,42 +227,42 @@ const VERTICES: [Vertex; 8] = [
     // 0
     Vertex {
         in_position: [-0.1, -0.1, -0.1],
-        in_color: [0.1, 0.0, 0.0, 0.1],
+        in_color: [1., 0.0, 0.0, 1.],
     },
     // 1
     Vertex {
         in_position: [0.1, -0.1, -0.1],
-        in_color: [0.0, 0.1, 0.0, 0.1],
+        in_color: [0.0, 1., 0.0, 1.],
     },
     // 2
     Vertex {
         in_position: [-0.1, 0.1, -0.1],
-        in_color: [0.0, 0.0, 0.1, 0.1],
+        in_color: [0.0, 0.0, 1., 1.],
     },
     // 3
     Vertex {
         in_position: [-0.1, -0.1, 0.1],
-        in_color: [0.1, 0.0, 0.0, 0.1],
+        in_color: [1., 0.0, 0.0, 1.],
     },
     // 4
     Vertex {
         in_position: [0.1, 0.1, -0.1],
-        in_color: [0.1, 0.1, 0.1, 0.1],
+        in_color: [1., 1., 1., 1.],
     },
     // 5
     Vertex {
         in_position: [0.1, -0.1, 0.1],
-        in_color: [0.0, 0.1, 0.0, 0.1],
+        in_color: [0.0, 1., 0.0, 1.],
     },
     // 6
     Vertex {
         in_position: [-0.1, 0.1, 0.1],
-        in_color: [0.0, 0.0, 0.1, 0.1],
+        in_color: [0.0, 0.0, 1., 1.],
     },
     // 7
     Vertex {
         in_position: [0.1, 0.1, 0.1],
-        in_color: [0.1, 0.1, 0.1, 0.1],
+        in_color: [1., 1., 1., 1.],
     },
 ];
 
@@ -322,16 +323,7 @@ impl winit::application::ApplicationHandler<AppMessage> for App {
                 if self.state.is_stopped() {
                     return;
                 }
-                self.queue.with(|_| {
-                    self.frame_stream.begin().unwrap();
-                    self.frame_stream
-                        .end(
-                            state.predicted_display_time,
-                            EnvironmentBlendMode::OPAQUE,
-                            &[],
-                        )
-                        .unwrap();
-                });
+                self.skip_frame(state).unwrap();
             }
             AppMessage::Frame(state) => {
                 if self.state.is_stopped() {
@@ -339,7 +331,7 @@ impl winit::application::ApplicationHandler<AppMessage> for App {
                 }
                 log::debug!("XR rendering");
                 self.queue.with(|_| self.frame_stream.begin().unwrap());
-                let (_, views) = self
+                let (view_flags, views) = self
                     .xr
                     .xr_session()
                     .locate_views(
@@ -348,6 +340,25 @@ impl winit::application::ApplicationHandler<AppMessage> for App {
                         self.xr.space(),
                     )
                     .unwrap();
+                if !view_flags
+                    .contains(ViewStateFlags::POSITION_VALID | ViewStateFlags::ORIENTATION_VALID)
+                {
+                    log::warn!("View state is not valid");
+                    self.queue
+                        .with(|_| {
+                            self.frame_stream.end(
+                                state.predicted_display_time,
+                                EnvironmentBlendMode::OPAQUE,
+                                &[],
+                            )
+                        })
+                        .unwrap();
+                    return;
+                }
+                log::trace!("{:?}", views[0].fov);
+                log::trace!("{:?}", views[1].fov);
+                log::trace!("{:?}", views[0].pose);
+                log::trace!("{:?}", views[1].pose);
                 let render_size = self.xr.render_size();
                 let views = (&views[..]).try_into().unwrap();
                 let image_index = self
@@ -396,6 +407,7 @@ impl winit::application::ApplicationHandler<AppMessage> for App {
 
                 let layer = openxr::CompositionLayerProjection::new()
                     .space(space)
+                    .layer_flags(CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA)
                     .views(&views);
                 let layers: &[&openxr::CompositionLayerBase<_>] = if let Some(p) = self.passthrough
                 {
@@ -421,7 +433,7 @@ impl winit::application::ApplicationHandler<AppMessage> for App {
                         &*(&passthrough_layer as *const openxr::sys::CompositionLayerPassthroughHTC)
                             .cast()
                     };
-                    &[&layer, passthrough_layer]
+                    &[passthrough_layer, &layer]
                 } else {
                     &[&layer]
                 };
@@ -449,6 +461,16 @@ impl winit::application::ApplicationHandler<AppMessage> for App {
 }
 
 impl App {
+    fn skip_frame(&mut self, state: FrameState) -> Result<(), openxr::sys::Result> {
+        self.queue.with(|_| {
+            self.frame_stream.begin()?;
+            self.frame_stream.end(
+                state.predicted_display_time,
+                EnvironmentBlendMode::OPAQUE,
+                &[],
+            )
+        })
+    }
     fn process_xr_events(&mut self) -> Result<()> {
         let mut buf = openxr::EventDataBuffer::new();
         while let Some(event) = self.xr.xr_instance().poll_event(&mut buf)? {

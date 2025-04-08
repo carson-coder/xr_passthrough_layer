@@ -181,6 +181,7 @@ impl OpenXr {
         xr_system: openxr::SystemId,
     ) -> Result<Arc<Instance>> {
         let vk_requirements = xr_instance.graphics_requirements::<openxr::Vulkan>(xr_system)?;
+        log::info!("Vulkan requirements: {vk_requirements:?}");
         let extensions = *get_vulkan_library().supported_extensions();
         vk_instance_extensions.khr_surface = true;
         if let Some(unsupported) = vk_instance_extensions
@@ -203,7 +204,8 @@ impl OpenXr {
             enabled_extensions: vk_instance_extensions,
             enabled_layers: vec![
                 "VK_LAYER_KHRONOS_validation".to_owned(),
-                //                "VK_LAYER_LUNARG_gfxreconstruct".to_owned(),
+                //"VK_LAYER_LUNARG_api_dump".to_owned(),
+                //"VK_LAYER_LUNARG_gfxreconstruct".to_owned(),
             ],
             ..Default::default()
         };
@@ -246,7 +248,8 @@ impl OpenXr {
                     .application_info(&application_info)
                     .enabled_layer_names(&[
                         c"VK_LAYER_KHRONOS_validation".as_ptr(),
-                        //                        c"VK_LAYER_LUNARG_gfxreconstruct".as_ptr(),
+                        //c"VK_LAYER_LUNARG_api_dump".as_ptr(),
+                        //c"VK_LAYER_LUNARG_gfxreconstruct".as_ptr(),
                     ])) as *const _ as _,
             )?
         }

@@ -8,16 +8,13 @@ use std::{
 use proc_macro2::{token_stream, Delimiter, Group, Ident, Punct, TokenStream, TokenTree};
 
 fn parse_ident_map(tokens: TokenStream, map: &mut HashMap<String, String>) {
-    println!("parsing {tokens}");
     let mut tokens = tokens.into_iter();
     loop {
         let Ok(k) = tokens.expect_ident() else {
             break;
         };
-        println!("aSDF {k}");
         tokens.expect_punct(':').unwrap();
         let v = tokens.expect_ident().unwrap();
-        println!("a {v}");
         let old = map.insert(k.to_string(), v.to_string());
         if let Some(old) = old {
             panic!("Duplicate entry for key {old}");
@@ -369,9 +366,11 @@ struct ParsedSpec {
     command_to_extension: HashMap<String, String>,
     /// Map handle type to its parent type
     parent_of: HashMap<String, String>,
+    aliases: HashMap<String, String>,
+    aliases_of: HashMap<String, HashSet<String>>,
 }
 
-static CREATE_COMMANDS: LazyLock<ParsedSpec> = LazyLock::new(|| {
+static PARSED_SPEC: LazyLock<ParsedSpec> = LazyLock::new(|| {
     // We scan the spec for `xrCreate*` commands, and generate wrappers for them.
     let source = OPENXR_SPEC;
     let mut reader = std::io::Cursor::new(source);
@@ -472,10 +471,35 @@ static CREATE_COMMANDS: LazyLock<ParsedSpec> = LazyLock::new(|| {
         cmds
     };
 
+    let aliases = spec
+        .sections
+        .iter()
+        .filter_map(|s| {
+            if let spec::Section::Commands { command } = s {
+                Some(command)
+            } else {
+                None
+            }
+        })
+        .flat_map(|c| c.iter())
+        .filter_map(|cmd| {
+            cmd.alias
+                .as_ref()
+                .map(|alias| (cmd.name().to_string(), alias.to_string()))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut aliases_of = HashMap::<String, HashSet<String>>::new();
+    for (cmd, alias) in &aliases {
+        let aliases = aliases_of.entry(alias.clone()).or_default();
+        aliases.insert(cmd.clone());
+    }
+
     ParsedSpec {
         create_commands,
         command_to_extension,
         parent_of,
+        aliases,
+        aliases_of,
     }
 });
 
@@ -507,7 +531,7 @@ pub fn gen_create_wrapper(tokens: proc_macro::TokenStream) -> proc_macro::TokenS
         .into_iter()
         .next()
         .expect("missing $crate");
-    CREATE_COMMANDS
+    PARSED_SPEC
         .create_commands
         .iter()
         .map(|cmd| {
@@ -574,7 +598,7 @@ pub fn impl_create(tokens: proc_macro::TokenStream) -> proc_macro::TokenStream {
         .into_iter()
         .next()
         .expect("missing $crate");
-    CREATE_COMMANDS
+    PARSED_SPEC
         .create_commands
         .iter()
         .filter(|cmd| cmd.name != "xrCreateApiLayerInstance") // Create for Instance is written
@@ -589,7 +613,7 @@ pub fn impl_create(tokens: proc_macro::TokenStream) -> proc_macro::TokenStream {
                 *mut openxr::sys::#handle_ty,
             };
             let factory_name = format_ident!("{}Factory", handle_ty);
-            let fp = if let Some(extension) = CREATE_COMMANDS.command_to_extension.get(&cmd.name) {
+            let fp = if let Some(extension) = PARSED_SPEC.command_to_extension.get(&cmd.name) {
                 let ext = extension.strip_prefix("XR_").unwrap();
                 let (tag, _) = ext.split_once("_").unwrap();
                 let ext = format_ident!("{}", ext.to_lowercase());
@@ -654,7 +678,7 @@ pub fn gen_facades(tokens: proc_macro::TokenStream) -> proc_macro::TokenStream {
         })
         .collect::<HashSet<_>>();
 
-    CREATE_COMMANDS
+    PARSED_SPEC
         .create_commands
         .iter()
         .map(|cmd| {
@@ -694,7 +718,7 @@ fn find_closure(hooks: &mut HashMap<String, String>) -> Vec<String> {
             continue;
         }
         let name = format!("Xr{k}");
-        let parent = CREATE_COMMANDS
+        let parent = PARSED_SPEC
             .parent_of
             .get(&name)
             .unwrap_or_else(|| panic!("Can't find parent of {name}"));
@@ -711,7 +735,7 @@ fn find_closure(hooks: &mut HashMap<String, String>) -> Vec<String> {
                 continue;
             }
             let name = format!("Xr{new_hook}");
-            let parent = CREATE_COMMANDS.parent_of.get(&name).unwrap();
+            let parent = PARSED_SPEC.parent_of.get(&name).unwrap();
             if !hooks.contains_key(parent) {
                 tmp.push(parent.strip_prefix("Xr").unwrap().to_string());
             }
@@ -731,7 +755,7 @@ pub fn gen_override_table(tokens: proc_macro::TokenStream) -> proc_macro::TokenS
     let mut hooks = HashMap::new();
     let mut override_fns = HashMap::new();
     let crate_ = tokens.expect_ident().unwrap();
-    let all_generated_creates = CREATE_COMMANDS
+    let all_generated_creates = PARSED_SPEC
         .create_commands
         .iter()
         .map(|c| &c.name)
@@ -772,6 +796,9 @@ pub fn gen_override_table(tokens: proc_macro::TokenStream) -> proc_macro::TokenS
                 !all_generated_creates.contains(&from),
                 "{from} is an auto generated function, don't override it, hook the handle instead."
             );
+            if let Some(aliased) = PARSED_SPEC.aliases.get(&from) {
+                panic!("{from} is an alias, don't override it, hooked aliased function {aliased} instead.");
+            }
             if let Some(h) = from.strip_prefix("xrDestroy") {
                 let create_name = format!("xrCreate{h}");
                 assert!(
@@ -780,8 +807,19 @@ pub fn gen_override_table(tokens: proc_macro::TokenStream) -> proc_macro::TokenS
                 );
             }
             let v = format_ident!("{v}");
+            let aliases: TokenStream = PARSED_SPEC
+                .aliases_of
+                .get(&from)
+                .iter()
+                .flat_map(|a| a.iter())
+                .map(|alias| {
+                    quote! {
+                        #alias => unsafe { std::mem::transmute(#v as *const ()) },
+                    }
+                }).collect();
             quote! {
                 #from => unsafe { std::mem::transmute(#v as *const ()) },
+                #aliases
             }
         })
         .collect();
@@ -862,6 +900,5 @@ pub fn gen_override_table(tokens: proc_macro::TokenStream) -> proc_macro::TokenS
             }
         }};
     };
-    println!("{ret}");
     ret.into()
 }

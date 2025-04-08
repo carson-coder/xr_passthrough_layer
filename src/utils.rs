@@ -15,40 +15,6 @@ use vulkano::{
     Validated,
 };
 
-/// Adapt for static array to implement FromIterator.
-///
-/// This can be used to collect iterators with exactly N elements into an fixed array.
-/// If the size mismatches, `.from_iter` panics.
-pub(crate) struct Array<T, const N: usize>([T; N]);
-
-impl<T, const N: usize> Array<T, N> {
-    pub(crate) fn into_inner(self) -> [T; N] {
-        self.into()
-    }
-}
-
-impl<T, const N: usize> From<Array<T, N>> for [T; N] {
-    fn from(value: Array<T, N>) -> Self {
-        value.0
-    }
-}
-
-impl<T, const N: usize> FromIterator<T> for Array<T, N> {
-    fn from_iter<Iter: IntoIterator<Item = T>>(iter: Iter) -> Self {
-        let mut iter = iter.into_iter();
-        let mut storage = std::mem::MaybeUninit::<[T; N]>::uninit();
-        let ptr: *mut T = storage.as_mut_ptr() as _;
-        for i in 0..N {
-            unsafe {
-                ptr.wrapping_add(i)
-                    .write(iter.next().expect("Iterator doesn't have enough items"))
-            };
-        }
-        assert!(iter.next().is_none(), "Array is too small");
-        Array(unsafe { storage.assume_init() })
-    }
-}
-
 pub trait DeviceExt {
     type HostToDeviceAllocator: MemoryAllocator;
     fn new_image(

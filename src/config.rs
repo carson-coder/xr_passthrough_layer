@@ -32,52 +32,12 @@ pub const fn default_display_eye() -> Eye {
     Eye::Left
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-#[serde(tag = "mode")]
-pub enum DisplayMode {
-    #[default]
-    Direct,
-    /// display a stereo image on the overlay. conceptually the overlay becomes a portal from VR
-    /// space to real world. you will be able to see more of the real world if the overlay occupys
-    /// more of your field of view.
-    Stereo {
-        /// how is the camera's image projected onto the overlay
-        #[serde(default)]
-        projection_mode: ProjectionMode,
-    },
-    /// display one of the camera's image on the overlay
-    Flat {
-        /// which camera's image to display
-        #[serde(default = "default_display_eye")]
-        eye: Eye,
-    },
-}
-
-impl DisplayMode {
-    pub(crate) fn projection_mode(&self) -> Option<ProjectionMode> {
-        match self {
-            DisplayMode::Stereo { projection_mode } => Some(*projection_mode),
-            _ => None,
-        }
-    }
-    pub(crate) fn is_stereo(&self) -> bool {
-        matches!(self, DisplayMode::Stereo { .. } | DisplayMode::Direct)
-    }
-}
-
-pub const fn default_z_order() -> u32 {
-    u32::MAX
-}
-
 /// Index camera passthrough
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     /// camera device to use. auto detect if not set
     #[serde(default)]
     pub camera_device: String,
-    /// how is the camera view displayed on the overlay
-    #[serde(default)]
-    pub display_mode: DisplayMode,
     /// enable debug option, including:
     ///   - use trigger button to do renderdoc capture
     #[serde(default)]
@@ -88,18 +48,17 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             camera_device: "".to_owned(),
-            display_mode: Default::default(),
             debug: false,
         }
     }
 }
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage},
     command_buffer::{
-        allocator::CommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage,
-        CopyBufferToImageInfo, PrimaryCommandBufferAbstract as _,
+        AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferToImageInfo,
+        PrimaryCommandBufferAbstract as _, allocator::CommandBufferAllocator,
     },
     device::Queue,
     image::{ImageCreateInfo, ImageUsage},
@@ -248,7 +207,7 @@ pub fn load_splash(
         img.len() as _,
     )?;
     buffer.write()?.copy_from_slice(&img);
-    cmdbuf.copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(buffer, vkimg.clone()))?;
+    cmdbuf.copy_buffer_to_image(CopyBufferToImageInfo::new(buffer, vkimg.clone()))?;
     cmdbuf
         .build()?
         .execute(queue.clone())?

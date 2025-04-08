@@ -3,14 +3,13 @@ use std::{
     thread::JoinHandle,
 };
 
-use crate::pipeline::PostprocessPipeline;
-
 use super::FrameInfo;
 use anyhow::{anyhow, Context};
 use arc_swap::{ArcSwap, Guard};
+use glam::UVec2;
 use log::{info as debug, warn};
 use smallvec::SmallVec;
-use vulkano::{image::Image, sync::GpuFuture};
+use v4l::video::Capture;
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 enum Control {
@@ -28,20 +27,24 @@ pub struct CameraThread {
 }
 
 impl CameraThread {
-    pub fn new(
-        camera: v4l::Device,
-        splash: Arc<Image>,
-        postprocessor: Box<dyn PostprocessPipeline + Send>,
-    ) -> Self {
+    pub fn new(camera: v4l::Device, splash_png: &[u8]) -> Self {
         let (tx, rx) = mpsc::channel();
+        let img = image::load_from_memory_with_format(splash_png, image::ImageFormat::Png)
+            .unwrap()
+            .into_rgba8();
+        let extent = [img.width(), img.height()];
+        assert!(extent[0] % 2 == 0);
+
         let frame = FrameInfo {
-            frame: splash,
+            frame: img.into_raw(),
             frame_time: std::time::Instant::now(),
+            needs_postprocess: false, // splash image doesn't need postprocessing
+            size: UVec2::new(extent[0] / 2, extent[1]),
         };
         let frame = Arc::new(ArcSwap::new(Arc::new(frame)));
         let join = std::thread::spawn({
             let frame = frame.clone();
-            move || Self::run(rx, camera, postprocessor, frame)
+            move || Self::run(rx, camera, frame)
         });
         Self {
             frame,
@@ -63,12 +66,7 @@ impl CameraThread {
         self.join.join().map_err(|e| anyhow!("{e:?}"))
     }
 
-    fn run(
-        control: mpsc::Receiver<Control>,
-        camera: v4l::Device,
-        postprocessor: Box<dyn PostprocessPipeline>,
-        frame: Arc<ArcSwap<FrameInfo>>,
-    ) {
+    fn run(control: mpsc::Receiver<Control>, camera: v4l::Device, frame: Arc<ArcSwap<FrameInfo>>) {
         // hold the thread until we get a go signal
         match control.recv() {
             Err(std::sync::mpsc::RecvError) | Ok(Control::Exit) => {
@@ -78,7 +76,7 @@ impl CameraThread {
             Ok(Control::Resume) => (),
             Ok(Control::Pause) => panic!("Invalid pause command"),
         }
-        let Err(e) = Self::run_inner(control, camera, postprocessor, frame) else {
+        let Err(e) = Self::run_inner(control, camera, frame) else {
             debug!("camera thread stopped");
             return;
         };
@@ -87,13 +85,8 @@ impl CameraThread {
     fn run_inner(
         control: mpsc::Receiver<Control>,
         camera: v4l::Device,
-        postprocessor: Box<dyn PostprocessPipeline>,
         frame: Arc<ArcSwap<FrameInfo>>,
     ) -> anyhow::Result<()> {
-        let mut render_doc = renderdoc::RenderDoc::<renderdoc::V100>::new().ok();
-        if render_doc.is_some() {
-            log::info!("RenderDoc loaded");
-        }
         let mut first_frame_time = None;
         // We want to make the latency as low as possible, so only set a single buffer.
         let mut video_stream =
@@ -102,6 +95,10 @@ impl CameraThread {
         let mut is_splash = true;
         const MAX_POOL_SIZE: usize = 2;
         let mut pool = SmallVec::<[Arc<FrameInfo>; 2]>::new();
+        let camera_format = camera.format()?;
+        if camera_format.width % 2 != 0 {
+            return Err(anyhow!("Camera width is not even"));
+        }
 
         let find_free = |pool: &mut SmallVec<_>| {
             // Find unused image from pool
@@ -137,31 +134,28 @@ impl CameraThread {
                 now
             };
             log::trace!("got camera frame {:?}", frame_time);
-            let mut new_frame = find_free(&mut pool)
-                .map(Ok::<_, anyhow::Error>)
+            let new_frame = find_free(&mut pool)
+                .map(|mut fi| {
+                    log::trace!("Reusing frame");
+                    let mfi = Arc::get_mut(&mut fi).unwrap();
+                    mfi.frame.copy_from_slice(frame_data);
+                    mfi.frame_time = frame_time;
+                    mfi.needs_postprocess = true;
+                    fi
+                })
                 .unwrap_or_else(|| {
-                    log::info!("Allocated new frame");
-                    Ok(FrameInfo {
-                        frame: postprocessor.allocate_image()?,
+                    log::debug!("Allocated new frame");
+                    FrameInfo {
+                        frame: frame_data.to_vec(),
                         frame_time: std::time::Instant::now(),
+                        needs_postprocess: true,
+                        size: UVec2::new(camera_format.width / 2, camera_format.height),
                     }
-                    .into())
-                })?;
-            {
-                // This `get_mut` can't fail, `find_free` returns `Arc` that's unique, if it
-                // returns `None` then `new_frame` will be a newly allocated `Arc`.
-                let new_frame = Arc::get_mut(&mut new_frame).unwrap();
-                if let Some(rd) = render_doc.as_mut() {
-                    rd.trigger_capture();
-                }
-                new_frame.frame_time = frame_time;
-                postprocessor
-                    .postprocess(frame_data, new_frame.frame.clone())?
-                    .then_signal_fence()
-                    .wait(None)?;
-            }
+                    .into()
+                });
             let old_frame = frame.swap(new_frame);
-            // splash image isn't allocated from the pipeline, so it can't be reused.
+            // splash image isn't necessarily `frame_data` sized, so don't reuse it.
+            // if we already have too many frames, just release the old one.
             if !is_splash && pool.len() < MAX_POOL_SIZE {
                 pool.push(old_frame);
             } else {

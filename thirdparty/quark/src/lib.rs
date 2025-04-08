@@ -31,6 +31,32 @@ pub unsafe trait Hooked<By>: Low
 where
     By: Hook<Target = Self>,
 {
+    fn registered_with_hook(self) -> Result<WithHook<By>, RegisterationError> {
+        let r = DATA_REGISTRY
+            .get(&self.into_raw())
+            .ok_or(RegisterationError::NotFound(self.into_raw()))?;
+        if r.0.is::<By>() {
+            Ok(WithHook(r, PhantomData))
+        } else {
+            Err(RegisterationError::TypeMismatch(
+                self.into_raw(),
+                std::any::type_name::<Self>(),
+            ))
+        }
+    }
+    fn registered_with_hook_mut(self) -> Result<WithHookMut<By>, RegisterationError> {
+        let r = DATA_REGISTRY
+            .get_mut(&self.into_raw())
+            .ok_or(RegisterationError::NotFound(self.into_raw()))?;
+        if r.0.is::<By>() {
+            Ok(WithHookMut(r, PhantomData))
+        } else {
+            Err(RegisterationError::TypeMismatch(
+                self.into_raw(),
+                std::any::type_name::<Self>(),
+            ))
+        }
+    }
     // fn handle(&self) -> Self::Handle;
 
     // /// Retrieve the associated hook object
@@ -150,36 +176,6 @@ pub unsafe trait Low: sealed::Create {
             .map_err(|_| {
                 RegisterationError::TypeMismatch(self.into_raw(), std::any::type_name::<Self>())
             })
-    }
-    fn registered_with_hook<H: Hook<Target = Self>>(
-        self,
-    ) -> Result<WithHook<H>, RegisterationError> {
-        let r = DATA_REGISTRY
-            .get(&self.into_raw())
-            .ok_or(RegisterationError::NotFound(self.into_raw()))?;
-        if r.0.is::<H>() {
-            Ok(WithHook(r, PhantomData))
-        } else {
-            Err(RegisterationError::TypeMismatch(
-                self.into_raw(),
-                std::any::type_name::<Self>(),
-            ))
-        }
-    }
-    fn registered_with_hook_mut<H: Hook<Target = Self>>(
-        self,
-    ) -> Result<WithHookMut<H>, RegisterationError> {
-        let r = DATA_REGISTRY
-            .get_mut(&self.into_raw())
-            .ok_or(RegisterationError::NotFound(self.into_raw()))?;
-        if r.0.is::<H>() {
-            Ok(WithHookMut(r, PhantomData))
-        } else {
-            Err(RegisterationError::TypeMismatch(
-                self.into_raw(),
-                std::any::type_name::<Self>(),
-            ))
-        }
     }
 }
 

@@ -1,39 +1,44 @@
 use ash::vk::Handle as _;
 use glam::{UVec2, Vec3};
-use log::{error, info as debug, warn};
+use log::{debug, error, warn};
 use openxr::{
-    sys::Handle, AsHandle, SwapchainCreateFlags, SwapchainCreateInfo, SwapchainUsageFlags,
+    AsHandle, CompositionLayerFlags, Extent2Di, Offset2Di, Rect2Di, ReferenceSpaceType,
+    SwapchainCreateFlags, SwapchainCreateInfo, SwapchainSubImage, SwapchainUsageFlags,
+    ViewStateFlags, sys::Handle,
 };
-use quark::{prelude::*, try_xr, types::AnySession, Low};
+use quark::{Hooked as _, Low as _, prelude::*, try_xr, types::AnySession};
 use smallvec::smallvec;
 use std::{
-    collections::HashSet,
-    ffi::{c_char, CStr},
+    collections::{HashMap, HashSet},
+    ffi::{CStr, c_char},
     hint::unreachable_unchecked,
     mem::MaybeUninit,
     sync::{Arc, LazyLock, OnceLock},
 };
 use vulkano::{
     command_buffer::{
+        AutoCommandBufferBuilder, BlitImageInfo, CommandBufferUsage, ImageBlit,
         allocator::{
             CommandBufferAllocator, StandardCommandBufferAllocator,
             StandardCommandBufferAllocatorCreateInfo,
         },
-        AutoCommandBufferBuilder, BlitImageInfo, CommandBufferUsage, ImageBlit,
     },
     descriptor_set::allocator::{
         DescriptorSetAllocator, StandardDescriptorSetAllocator,
         StandardDescriptorSetAllocatorCreateInfo,
     },
     device::QueueCreateInfo,
-    image::{ImageAspects, ImageCreateInfo, ImageLayout, ImageSubresourceLayers, ImageUsage},
+    image::{ImageCreateInfo, ImageLayout, ImageUsage},
     memory::allocator::{MemoryAllocator, StandardMemoryAllocator},
+    sync::GpuFuture,
 };
 struct CameraResources {
     /// Extra swapchain for our own rendering needs
     swapchain: openxr::Swapchain<openxr::Vulkan>,
+    size: UVec2,
     images: Vec<Arc<vulkano::image::Image>>,
     camera: crate::camera::CameraThread,
+    pp: crate::pipeline::Pipeline,
 }
 enum SessionState {
     Running {
@@ -89,6 +94,9 @@ impl SessionState {
         }
     }
 }
+fn xrcvt(e: XrErr) -> Result<(), XrErr> {
+    if e == XrErr::SUCCESS { Ok(()) } else { Err(e) }
+}
 struct SessionDataInner {
     device: Arc<vulkano::device::Device>,
     queue: Arc<vulkano::device::Queue>,
@@ -97,15 +105,203 @@ struct SessionDataInner {
     allocator: Arc<dyn MemoryAllocator>,
     cmdbuf_allocator: Arc<dyn CommandBufferAllocator>,
     descriptor_set_allocator: Arc<dyn DescriptorSetAllocator>,
+    space: openxr::Space,
 }
 #[derive(Default)]
 pub struct SessionData {
     inner: Option<SessionDataInner>,
 }
+impl SessionData {
+    unsafe fn end_frame(
+        &mut self,
+        session: &quark::types::AnySession,
+        instance: &openxr::Instance,
+        info: &openxr::sys::FrameEndInfo,
+    ) -> Result<(), XrErr> {
+        let Some(data) = &mut self.inner else {
+            // We are not wrapping this session, passed it through.
+            debug!("Unhandled session, like passthrough extension wasn't enabled");
+            return xrcvt(unsafe { (instance.fp().end_frame)(session.as_handle(), info) });
+        };
+        let quark::types::AnySession::Vulkan(xr_vk_session) = session else {
+            unreachable!()
+        };
+        let SessionState::RunningWithPassthrough {
+            camera,
+            image_index,
+            view_type,
+            ..
+        } = &mut data.state
+        else {
+            if matches!(data.state, SessionState::Running { .. }) {
+                return Ok(());
+            } else {
+                return Err(XrErr::ERROR_SESSION_NOT_RUNNING);
+            }
+        };
+        let layers = unsafe {
+            std::slice::from_raw_parts(
+                // Safety: Option<&T> and *const T are bitwise identical.
+                info.layers as *const Option<&openxr::sys::CompositionLayerBaseHeader>,
+                info.layer_count as _,
+            )
+        };
+        let has_passthrough = layers
+            .iter()
+            .filter(|l| {
+                l.is_some_and(|l| l.ty == openxr::sys::CompositionLayerPassthroughHTC::TYPE)
+            })
+            .count();
+        if has_passthrough > 1 {
+            warn!("More than one passthrough layer, not supported");
+            return Err(XrErr::ERROR_VALIDATION_FAILURE);
+        }
+        if has_passthrough == 0 || image_index.is_none() {
+            // No passthrough layer, we can just pass the frame to openxr.
+            return xrcvt(unsafe { (instance.fp().end_frame)(session.as_handle(), info) });
+        }
+        let (view_state_flags, view_locations) =
+            xr_vk_session.locate_views(*view_type, info.display_time, &data.space)?;
+        if !view_state_flags
+            .contains(ViewStateFlags::POSITION_VALID | ViewStateFlags::ORIENTATION_VALID)
+        {
+            warn!("Pose or orientation invalid {view_state_flags:?}, skip passthrough layer");
+            let layers = layers
+                .iter()
+                .filter(|l| {
+                    l.is_none_or(|l| l.ty != openxr::sys::CompositionLayerPassthroughHTC::TYPE)
+                })
+                .collect::<Vec<_>>();
+            let mut info = *info;
+            info.layer_count = layers.len() as _;
+            info.layers = layers.as_ptr() as *const _;
+            return xrcvt(unsafe { (instance.fp().end_frame)(session.as_handle(), &info) });
+        }
+        let image_index = image_index.take().unwrap();
+        // Copy camera image to swapchain
+        let mut cmdbuf = AutoCommandBufferBuilder::primary(
+            data.cmdbuf_allocator.clone(),
+            data.queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .map_err(|e| {
+            warn!("Failed to create command buffer {e:#}");
+            XrErr::ERROR_RUNTIME_FAILURE
+        })?;
+        let camera_frame = camera.camera.frame();
+        camera.pp.maybe_postprocess(&camera_frame).map_err(|e| {
+            warn!("Failed to postprocess camera frame {e:#}");
+            XrErr::ERROR_RUNTIME_FAILURE
+        })?;
+        let (camera_image, fut) = camera.pp.image();
+        let camera_extent = camera.pp.image_extent();
+        cmdbuf
+            .blit_image(BlitImageInfo {
+                src_image: camera_image.clone(),
+                dst_image: camera.images[image_index as usize].clone(),
+                regions: smallvec![ImageBlit {
+                    src_subresource: camera_image.subresource_layers(),
+                    src_offsets: [[0, 0, 0], [camera_extent[0], camera_extent[1], 1],],
+                    dst_subresource: camera.images[image_index as usize].subresource_layers(),
+                    dst_offsets: [[0, 0, 0], [camera.size.x * 2, camera.size.y, 1],],
+                    ..Default::default()
+                }],
+                ..BlitImageInfo::new(
+                    camera_image.clone(),
+                    camera.images[image_index as usize].clone(),
+                )
+            })
+            .map_err(|e| {
+                warn!("Failed to blit image {e:#}");
+                XrErr::ERROR_RUNTIME_FAILURE
+            })?;
+        let cmdbuf = cmdbuf.build().map_err(|e| {
+            warn!("Failed to build command buffer {e:#}");
+            XrErr::ERROR_RUNTIME_FAILURE
+        })?;
+        fut.then_execute(data.queue.clone(), cmdbuf)
+            .map_err(|e| {
+                warn!("Failed to execute command buffer {e:#}");
+                XrErr::ERROR_RUNTIME_FAILURE
+            })?
+            .then_signal_fence_and_flush()
+            .map_err(|e| {
+                warn!("Failed to flush command buffer {e:#}");
+                XrErr::ERROR_RUNTIME_FAILURE
+            })?
+            .wait(None)
+            .map_err(|e| {
+                warn!("Failed to wait for fence {e:#}");
+                XrErr::ERROR_RUNTIME_FAILURE
+            })?;
+        assert_eq!(view_locations.len(), 2);
+        camera.swapchain.release_image()?;
+        log::trace!("{:?}", view_locations[0].fov);
+        log::trace!("{:?}", view_locations[1].fov);
+        log::trace!("{:?}", view_locations[0].pose);
+        log::trace!("{:?}", view_locations[1].pose);
+        let views = [
+            openxr::CompositionLayerProjectionView::new()
+                .sub_image(
+                    SwapchainSubImage::new()
+                        .swapchain(&camera.swapchain)
+                        .image_rect(Rect2Di {
+                            offset: Offset2Di { x: 0, y: 0 },
+                            extent: Extent2Di {
+                                width: camera.size.x as _,
+                                height: camera.size.y as _,
+                            },
+                        }),
+                )
+                .pose(view_locations[0].pose)
+                .fov(view_locations[0].fov),
+            openxr::CompositionLayerProjectionView::new()
+                .sub_image(
+                    SwapchainSubImage::new()
+                        .swapchain(&camera.swapchain)
+                        .image_rect(Rect2Di {
+                            offset: Offset2Di {
+                                x: camera.size.x as _,
+                                y: 0,
+                            },
+                            extent: Extent2Di {
+                                width: camera.size.x as _,
+                                height: camera.size.y as _,
+                            },
+                        }),
+                )
+                .pose(view_locations[1].pose)
+                .fov(view_locations[1].fov),
+        ];
+
+        let replaced_passthrough_layer = openxr::CompositionLayerProjection::new()
+            .space(&data.space)
+            .layer_flags(CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA)
+            .views(&views);
+        let pos = layers
+            .iter()
+            .position(|l| {
+                l.is_some_and(|l| l.ty == openxr::sys::CompositionLayerPassthroughHTC::TYPE)
+            })
+            .unwrap();
+        let mut layers = layers.to_vec();
+        layers[pos] = unsafe {
+            std::mem::transmute::<
+                Option<&openxr::sys::CompositionLayerProjection>,
+                Option<&openxr::sys::CompositionLayerBaseHeader>,
+            >(Some(replaced_passthrough_layer.as_raw()))
+        };
+        let mut info = *info;
+        info.layers = layers.as_ptr() as *const _;
+        xrcvt(unsafe { (instance.fp().end_frame)(session.as_handle(), &info) })
+    }
+}
 
 // Define your instance data
 pub struct InstanceData {
     is_passthrough_enabled: bool,
+    /// Mapping raw vulkan VkInstance handles to the api version it was created with.
+    instance_api_version: HashMap<u64, vulkano::Version>,
 }
 
 struct PassthroughMesh<'a> {
@@ -180,7 +376,7 @@ impl Drop for PassthroughInner {
 }
 
 pub struct PassthroughData {
-    inner: Arc<PassthroughInner>,
+    _inner: Arc<PassthroughInner>,
     form: openxr::sys::PassthroughFormHTC,
 
     /// Allocate 1 byte whose address is used as an unique id for the passthrough
@@ -194,7 +390,7 @@ unsafe impl quark::Factory<PassthroughData> for PassthroughFactory {
     unsafe fn create(
         args: quark::CreateArgs<openxr::sys::PassthroughHTC>,
     ) -> Result<(quark::Facade<openxr::sys::PassthroughHTC>, PassthroughData), XrErr> {
-        let mut session = args.0.registered_with_hook_mut::<SessionData>()?;
+        let mut session = args.0.registered_with_hook_mut()?;
         let (session_data, session) = session.both();
         let quark::types::AnySession::Vulkan(session) = session else {
             warn!("Creating passthrough out of a non-vulkan session is not supported");
@@ -229,7 +425,7 @@ unsafe impl quark::Factory<PassthroughData> for PassthroughFactory {
             .clone();
 
         let ret = PassthroughData {
-            inner: passthrough,
+            _inner: passthrough,
             form,
             unique: Box::new(MaybeUninit::uninit()),
         };
@@ -252,7 +448,7 @@ const REQUIRED_VK_INSTANCE_EXTENSIONS: &[&CStr] = &[
     ash::vk::KHR_XCB_SURFACE_NAME,
 ];
 
-const REQUIRED_VK_DEVICE_EXTENSIONS: &[&CStr] = &[];
+const REQUIRED_VK_DEVICE_EXTENSIONS: &[&CStr] = &[ash::vk::KHR_COPY_COMMANDS2_NAME];
 
 static VULKAN_LIBRARY: LazyLock<Arc<vulkano::library::VulkanLibrary>> =
     LazyLock::new(|| vulkano::library::VulkanLibrary::new().unwrap());
@@ -346,7 +542,7 @@ unsafe extern "system" fn get_vulkan_instance_extensions(
     count: *mut u32,
     buffer: *mut c_char,
 ) -> XrErr {
-    let wrapped_instance = try_xr!(instance.registered_with_hook::<InstanceData>());
+    let wrapped_instance = try_xr!(instance.registered_with_hook());
     let Some(vulkan_enable) = wrapped_instance.get().exts().khr_vulkan_enable else {
         return XrErr::ERROR_VALIDATION_FAILURE;
     };
@@ -370,7 +566,7 @@ unsafe extern "system" fn get_vulkan_device_extensions(
     count: *mut u32,
     buffer: *mut c_char,
 ) -> XrErr {
-    let wrapped_instance = try_xr!(instance.registered_with_hook::<InstanceData>());
+    let wrapped_instance = try_xr!(instance.registered_with_hook());
     let Some(vulkan_enable) = wrapped_instance.get().exts().khr_vulkan_enable else {
         return XrErr::ERROR_VALIDATION_FAILURE;
     };
@@ -390,11 +586,11 @@ unsafe extern "system" fn get_vulkan_device_extensions(
 unsafe extern "system" fn create_vulkan_instance(
     instance: openxr::sys::Instance,
     create_info: *const openxr::sys::VulkanInstanceCreateInfoKHR,
-    device: *mut ash::vk::Instance,
+    out_vk_instance: *mut ash::vk::Instance,
     result: *mut ash::vk::Result,
 ) -> XrErr {
     debug!("Creating Vulkan instance");
-    let wrapped_instance = try_xr!(instance.registered_with_hook::<InstanceData>());
+    let mut wrapped_instance = try_xr!(instance.registered_with_hook_mut());
     let Some(vulkan_enable2) = wrapped_instance.get().exts().khr_vulkan_enable2 else {
         warn!("Calling create_vulkan_instance without khr_vulkan_enable2");
         return XrErr::ERROR_VALIDATION_FAILURE;
@@ -428,14 +624,25 @@ unsafe extern "system" fn create_vulkan_instance(
         vk_create_info.pp_enabled_extension_names = new_extensions.as_ptr();
         new_create_info.vulkan_create_info = &vk_create_info as *const _ as *const _;
     }
-    unsafe {
+    let ret = unsafe {
         (vulkan_enable2.create_vulkan_instance)(
             instance,
             &new_create_info,
-            device as *mut _,
+            out_vk_instance as *mut _,
             result as *mut _,
         )
+    };
+    if ret != XrErr::SUCCESS {
+        return ret;
     }
+
+    wrapped_instance.hook().instance_api_version.insert(
+        unsafe { *out_vk_instance }.as_raw(),
+        unsafe { *vk_create_info.p_application_info }
+            .api_version
+            .into(),
+    );
+    ret
 }
 
 unsafe extern "system" fn create_vulkan_device(
@@ -445,7 +652,7 @@ unsafe extern "system" fn create_vulkan_device(
     result: *mut ash::vk::Result,
 ) -> XrErr {
     debug!("Creating Vulkan device");
-    let wrapped_instance = try_xr!(instance.registered_with_hook::<InstanceData>());
+    let wrapped_instance = try_xr!(instance.registered_with_hook());
     let Some(vulkan_enable2) = wrapped_instance.get().exts().khr_vulkan_enable2 else {
         return XrErr::ERROR_VALIDATION_FAILURE;
     };
@@ -469,6 +676,10 @@ unsafe extern "system" fn create_vulkan_device(
         .iter()
         .filter(|&&e| !requested_extensions.contains(e));
     debug!("Extensions: {:?}", requested_extensions);
+    debug!(
+        "Extra Extensions: {:?}",
+        extra_extensions.clone().collect::<Vec<_>>()
+    );
     let mut new_create_info = unsafe { *create_info };
     let mut new_extensions = Vec::new();
     if extra_extensions.clone().count() > 0 {
@@ -543,6 +754,7 @@ unsafe impl quark::Factory<InstanceData> for InstanceFactory {
         let (high, _create_info) = unsafe { (*instance).into_high(args) }?;
         let this = InstanceData {
             is_passthrough_enabled: enabled,
+            instance_api_version: HashMap::new(),
         };
         Ok((high, this))
     }
@@ -557,11 +769,11 @@ impl quark::Hook for SessionData {
     type Factory = quark::FactoryOf<Self>;
     fn on_create(
         session: &AnySession,
-        create_info: <openxr::sys::Session as Low>::HighCreateInfo,
+        create_info: quark::types::SessionCreateInfo,
     ) -> XrResult<Self> {
         debug!("on_create(): OpenXR session");
         // Do we have vulkan?
-        let AnySession::Vulkan(vulkan) = session else {
+        let AnySession::Vulkan(xr_vk_session) = session else {
             warn!("Not a vulkan session, don't know how to handle it");
             return Ok(Self::default());
         };
@@ -569,16 +781,32 @@ impl quark::Hook for SessionData {
         let quark::types::GraphicsBinding::Vulkan(gb) = gb else {
             unreachable!()
         };
-        let instance = vulkan
+        let instance = xr_vk_session
             .instance()
             .as_handle()
-            .registered_with_hook::<InstanceData>()?;
+            .registered_with_hook()?;
         if instance.hook().is_passthrough_enabled {
+            let api_version = instance
+                .hook()
+                .instance_api_version
+                .get(&(gb.instance as u64));
+            let api_version = if let Some(v) = api_version {
+                *v
+            } else {
+                let req = xr_vk_session
+                    .instance()
+                    .graphics_requirements::<openxr::Vulkan>(create_info.system_id)?;
+                // This vulkan instance wasn't created via `xrCreateVulkanInstanceKHR`, we have to
+                // assume minimum supported api version.
+                (req.min_api_version_supported.into_raw() as u32).into()
+            };
+            log::info!("Vulkan API version: {api_version}");
             let vk_create_info = vulkano::instance::InstanceCreateInfo {
                 enabled_extensions: REQUIRED_VK_INSTANCE_EXTENSIONS
                     .iter()
                     .map(|&e| e.to_str().unwrap())
                     .collect(),
+                max_api_version: Some(api_version),
                 ..Default::default()
             };
             let vk_instance = unsafe {
@@ -633,12 +861,15 @@ impl quark::Hook for SessionData {
                 device.clone(),
                 StandardDescriptorSetAllocatorCreateInfo::default(),
             ));
+            let space = xr_vk_session
+                .create_reference_space(ReferenceSpaceType::STAGE, openxr::Posef::IDENTITY)?;
 
             Ok(Self {
                 inner: Some(SessionDataInner {
                     device,
                     queue,
                     state: SessionState::Idle,
+                    space,
                     system_id: create_info.system_id,
                     allocator,
                     cmdbuf_allocator,
@@ -653,9 +884,10 @@ impl quark::Hook for SessionData {
 }
 
 static CAMERA_CONFIG: LazyLock<Option<crate::steam::StereoCamera>> =
-    LazyLock::new(|| crate::steam::find_steam_config());
+    LazyLock::new(crate::steam::find_steam_config);
 static SPLASH_IMAGE: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/splash.png"));
 
+#[allow(clippy::too_many_arguments)]
 fn create_camera_resources(
     instance: &openxr::Instance,
     session: &openxr::Session<openxr::Vulkan>,
@@ -686,7 +918,7 @@ fn create_camera_resources(
         .recommended_image_rect_height
         .max(cfgs[1].recommended_image_rect_height);
 
-    let postprocessor = crate::pipeline::Pipeline::new(
+    let pp = crate::pipeline::Pipeline::new(
         device.clone(),
         allocator.clone(),
         cmdbuf_allocator.clone(),
@@ -695,7 +927,7 @@ fn create_camera_resources(
         true,
         *CAMERA_CONFIG,
         ImageLayout::ShaderReadOnlyOptimal,
-        ImageUsage::SAMPLED,
+        ImageUsage::SAMPLED | ImageUsage::TRANSFER_SRC,
         pipeline_cache,
         UVec2::new(crate::CAMERA_SIZE, crate::CAMERA_SIZE),
         UVec2::new(width, height),
@@ -712,32 +944,42 @@ fn create_camera_resources(
         warn!("Failed to open camera {e:#}");
         XrErr::ERROR_RUNTIME_FAILURE
     })?;
-    let splash = crate::config::load_splash(
-        device.clone(),
-        allocator,
-        cmdbuf_allocator,
-        queue,
-        SPLASH_IMAGE,
-    )
-    .map_err(|e| {
-        warn!("Failed to load splash {e:#}");
-        XrErr::ERROR_RUNTIME_FAILURE
-    })?;
-    let formats = session.enumerate_swapchain_formats()?;
-    let camera = crate::camera::CameraThread::new(camera, splash, Box::new(postprocessor));
+    let formats = session
+        .enumerate_swapchain_formats()?
+        .into_iter()
+        .map(|f| vulkano::format::Format::try_from(ash::vk::Format::from_raw(f as i32)))
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(|()| {
+            warn!("Invalid swapchain formats");
+            XrErr::ERROR_RUNTIME_FAILURE
+        })?;
+    let camera = crate::camera::CameraThread::new(camera, SPLASH_IMAGE);
+    const PREFERRED_FORMATS: [vulkano::format::Format; 4] = [
+        vulkano::format::Format::R8G8B8A8_UNORM,
+        vulkano::format::Format::B8G8R8A8_UNORM,
+        vulkano::format::Format::R8G8B8A8_SRGB,
+        vulkano::format::Format::B8G8R8A8_SRGB,
+    ];
+
+    let Some(format) = PREFERRED_FORMATS
+        .iter()
+        .find(|f| formats.contains(f))
+        .copied()
+    else {
+        warn!("No suitable format found for swapchain");
+        return Err(XrErr::ERROR_RUNTIME_FAILURE);
+    };
     let swapchain = session.create_swapchain(&SwapchainCreateInfo {
         array_size: 1,
         face_count: 1,
-        format: formats[0],
+        format: format as u32,
         mip_count: 1,
         sample_count: cfgs[0].recommended_swapchain_sample_count,
-        usage_flags: SwapchainUsageFlags::COLOR_ATTACHMENT,
+        usage_flags: SwapchainUsageFlags::COLOR_ATTACHMENT | SwapchainUsageFlags::TRANSFER_DST,
         create_flags: SwapchainCreateFlags::EMPTY,
-        width,
+        width: width * 2,
         height,
     })?;
-    let format = ash::vk::Format::from_raw(formats[0] as i32);
-    let format = vulkano::format::Format::try_from(format).unwrap();
     let images = swapchain
         .enumerate_images()?
         .into_iter()
@@ -748,10 +990,10 @@ fn create_camera_resources(
                     ash::vk::Image::from_raw(raw_img),
                     ImageCreateInfo {
                         format,
-                        extent: [width, height, 1],
+                        extent: [width * 2, height, 1],
                         array_layers: 1,
                         mip_levels: 1,
-                        usage: ImageUsage::COLOR_ATTACHMENT,
+                        usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_DST,
                         ..Default::default()
                     },
                 )
@@ -767,7 +1009,9 @@ fn create_camera_resources(
     Ok(CameraResources {
         swapchain,
         camera,
+        pp,
         images,
+        size: UVec2::new(width, height),
     })
 }
 
@@ -776,10 +1020,10 @@ unsafe extern "system" fn begin_session(
     info: *const openxr::sys::SessionBeginInfo,
 ) -> XrErr {
     debug!("begin session {:#x}", session.into_raw());
-    let mut wrapped_session = try_xr!(session.registered_with_hook_mut::<SessionData>());
+    let mut wrapped_session = try_xr!(session.registered_with_hook_mut());
     let instance = try_xr!(quark::find_instance(session));
     let info = &unsafe { *info };
-    let wrapped_instance = try_xr!(instance.registered_with_hook::<InstanceData>());
+    let wrapped_instance = try_xr!(instance.registered_with_hook());
     let (data, wrapped_session) = wrapped_session.both();
     let Some(data) = &mut data.inner else {
         // We are not wrapping this session, passed it through.
@@ -794,7 +1038,7 @@ unsafe extern "system" fn begin_session(
     try_xr!(xr_vk_session.begin(info.primary_view_configuration_type));
     data.state = match &data.state {
         SessionState::Running { .. } | SessionState::RunningWithPassthrough { .. } => {
-            return XrErr::ERROR_SESSION_RUNNING
+            return XrErr::ERROR_SESSION_RUNNING;
         }
         SessionState::Idle => SessionState::Running {
             view_type: info.primary_view_configuration_type,
@@ -815,8 +1059,8 @@ unsafe extern "system" fn begin_session(
                 camera,
                 passthrough: passthrough.clone(),
                 view_type: info.primary_view_configuration_type,
-                image_index: None,
                 should_render: None,
+                image_index: None,
             }
         }
     };
@@ -826,7 +1070,7 @@ unsafe extern "system" fn begin_session(
 unsafe extern "system" fn end_session(raw_session: openxr::sys::Session) -> XrErr {
     debug!("end session {:#x}", raw_session.into_raw());
     let instance = try_xr!(quark::find_instance(raw_session));
-    let mut session = try_xr!(raw_session.registered_with_hook_mut::<SessionData>());
+    let mut session = try_xr!(raw_session.registered_with_hook_mut());
     let (data, session) = session.both();
     let Some(data) = &mut data.inner else {
         // We are not wrapping this session, passed it through.
@@ -838,7 +1082,7 @@ unsafe extern "system" fn end_session(raw_session: openxr::sys::Session) -> XrEr
     };
     data.state = match &data.state {
         SessionState::Idle | SessionState::IdleWithPassthrough { .. } => {
-            return XrErr::ERROR_SESSION_NOT_RUNNING
+            return XrErr::ERROR_SESSION_NOT_RUNNING;
         }
         SessionState::Running { .. } => SessionState::Idle,
         SessionState::RunningWithPassthrough { passthrough, .. } => {
@@ -856,18 +1100,24 @@ unsafe extern "system" fn wait_frame(
     wait_info: *const openxr::sys::FrameWaitInfo,
     frame_state: *mut openxr::sys::FrameState,
 ) -> XrErr {
-    debug!("wait frame {:#x}", raw_session.into_raw());
-    let instance = try_xr!(quark::find_instance(raw_session));
+    debug!("wait frame {:#x}, before", raw_session.into_raw());
+    let fp = {
+        // Can't keep the `registered` high-level instance object, because it
+        // locks the object registry. but `xrWaitFrame` must be callable from any thread, while
+        // `Begin/EndFrame` might be called concurrently from other threads, which needs this
+        // registry entry lock too, and `xrWaitFrame` might enter into wait.
+        let instance = try_xr!(quark::find_instance(raw_session));
+        try_xr!(instance.registered()).fp().wait_frame
+    };
 
     // We didn't keep the frame waiter given by openxr crate, just call the raw function.
-    let ret = unsafe {
-        (try_xr!(instance.registered()).fp().wait_frame)(raw_session, wait_info, frame_state)
-    };
+    let ret = unsafe { (fp)(raw_session, wait_info, frame_state) };
     if ret != XrErr::SUCCESS {
         return ret;
     }
+    debug!("wait frame {:#x}, after", raw_session.into_raw());
 
-    let mut session = try_xr!(raw_session.registered_with_hook_mut::<SessionData>());
+    let mut session = try_xr!(raw_session.registered_with_hook_mut());
     let data = session.hook();
     let Some(data) = &mut data.inner else {
         // We are not wrapping this session, passed it through.
@@ -891,13 +1141,18 @@ unsafe extern "system" fn begin_frame(
     raw_session: openxr::sys::Session,
     info: *mut openxr::sys::FrameBeginInfo,
 ) -> XrErr {
-    debug!("begin frame {:#x}", raw_session.into_raw());
+    debug!("begin frame {:#x} before", raw_session.into_raw());
     let instance = try_xr!(quark::find_instance(raw_session));
+    // Lock the registry entry for the xrSession. this is because xrBeginFrame might unblock
+    // a currently blocked xrWaitFrame. Our override for xrWaitFrame will acquire the xrSession
+    // from the registry to update `should_render`. We want to make sure it will only get the lock
+    // after we have set `should_render` to None.
+    let mut session = try_xr!(raw_session.registered_with_hook_mut());
     let ret = unsafe { (try_xr!(instance.registered()).fp().begin_frame)(raw_session, info) };
     if ret != XrErr::SUCCESS {
         return ret;
     }
-    let mut session = try_xr!(raw_session.registered_with_hook_mut::<SessionData>());
+    debug!("begin frame {:#x} after", raw_session.into_raw());
     let data = session.hook();
     let Some(data) = &mut data.inner else {
         // We are not wrapping this session, passed it through.
@@ -917,10 +1172,10 @@ unsafe extern "system" fn begin_frame(
             return XrErr::ERROR_SESSION_NOT_RUNNING;
         }
     };
-    let Some(should_render) = should_render else {
+    let Some(should_render) = should_render.take() else {
         return XrErr::ERROR_CALL_ORDER_INVALID;
     };
-    if !*should_render {
+    if !should_render {
         return XrErr::SUCCESS;
     }
     if image_index.is_some() {
@@ -939,81 +1194,10 @@ unsafe extern "system" fn end_frame(
     debug!("end frame {:#x}", raw_session.into_raw());
     let instance = try_xr!(quark::find_instance(raw_session));
     let instance = try_xr!(instance.registered());
-    let mut session = try_xr!(raw_session.registered_with_hook_mut::<SessionData>());
-    let data = session.hook();
-    let Some(data) = &mut data.inner else {
-        // We are not wrapping this session, passed it through.
-        debug!("Unhandled session, like passthrough extension wasn't enabled");
-        return unsafe { (instance.fp().end_frame)(raw_session, info) };
-    };
-    let SessionState::RunningWithPassthrough {
-        camera,
-        image_index,
-        should_render,
-        ..
-    } = &mut data.state
-    else {
-        if matches!(data.state, SessionState::Running { .. }) {
-            return XrErr::SUCCESS;
-        } else {
-            return XrErr::ERROR_SESSION_NOT_RUNNING;
-        }
-    };
-
+    let mut session = try_xr!(raw_session.registered_with_hook_mut());
     let info = unsafe { *info };
-    let layers = unsafe {
-        std::slice::from_raw_parts(
-            // Safety: Option<&T> and *const T are bitwise identical.
-            info.layers as *const Option<&openxr::sys::CompositionLayerBaseHeader>,
-            info.layer_count as _,
-        )
-    };
-    let has_passthrough = layers
-        .iter()
-        .any(|l| l.is_some_and(|l| l.ty == openxr::sys::CompositionLayerPassthroughHTC::TYPE));
-    *should_render = None;
-    if !has_passthrough || image_index.is_none() {
-        // No passthrough layer, we can just pass the frame to openxr.
-        return unsafe { (instance.fp().end_frame)(raw_session, &info) };
-    }
-    let image_index = image_index.take().unwrap();
-    // Copy camera image to swapchain
-    let mut cmdbuf = try_xr!(AutoCommandBufferBuilder::primary(
-        data.cmdbuf_allocator.clone(),
-        data.queue.queue_family_index(),
-        CommandBufferUsage::OneTimeSubmit,
-    )
-    .map_err(|e| {
-        warn!("Failed to create command buffer {e:#}");
-        XrErr::ERROR_RUNTIME_FAILURE
-    }));
-    let camera_frame = camera.camera.frame();
-    let camera_extent = camera_frame.frame.extent();
-    cmdbuf.blit_image(BlitImageInfo {
-        src_image: camera_frame.frame.clone(),
-        dst_image: camera.images[image_index as usize].clone(),
-        regions: smallvec![ImageBlit {
-            src_subresource: camera_frame.frame.subresource_layers(),
-            src_offsets: [[0, 0, 0], [camera_extent[0], camera_extent[1], 1],],
-            dst_subresource: camera.images[image_index as usize].subresource_layers(),
-            dst_offsets: [
-                [0, 0, 0],
-                [camera.swapchain.width(), camera.swapchain.height(), 1],
-            ],
-        }],
-        ..BlitImageInfo::new(
-            camera_frame.frame.clone(),
-            camera.images[image_index as usize].clone(),
-        )
-    });
-    if image_index.is_some() {
-        try_xr!(camera.swapchain.release_image());
-    }
-    *image_index = None;
-    let ret = unsafe { (instance.fp().end_frame)(raw_session, &info) };
-    if ret != XrErr::SUCCESS {
-        return ret;
-    }
+    let (data, session) = session.both();
+    try_xr!(unsafe { data.end_frame(session, &instance, &info) });
     XrErr::SUCCESS
 }
 

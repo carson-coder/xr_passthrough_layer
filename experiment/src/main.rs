@@ -6,9 +6,7 @@ use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{Context, Result, anyhow};
 
-use ::xr_passthrough_layer::{
-    CAMERA_SIZE, camera, find_index_camera, pipeline, steam, utils::DeviceExt as _,
-};
+use ::xr_passthrough_layer::{CAMERA_SIZE, camera, find_index_camera, pipeline, steam};
 use glam::UVec2;
 use v4l::video::Capture;
 use vulkano::{
@@ -27,7 +25,7 @@ use vulkano::{
     format,
     image::{Image, ImageLayout, ImageUsage},
     memory::allocator::StandardMemoryAllocator,
-    swapchain::{Surface, SurfaceInfo, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo},
+    swapchain::{SurfaceInfo, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo},
     sync::GpuFuture,
 };
 static APP_NAME: &str = "Camera\0";
@@ -43,6 +41,7 @@ struct Window {
 }
 
 struct App {
+    pp: pipeline::Pipeline,
     device: Arc<Device>,
     cmdbuf_allocator: Arc<dyn CommandBufferAllocator>,
     queue: Arc<Queue>,
@@ -138,10 +137,10 @@ impl App {
             self.queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         )?;
-        let src_image_guard = self.camera.frame(); // this guard has to be kept around until we
+        self.pp.maybe_postprocess(&self.camera.frame())?;
+        let (src_image, pp_fut) = self.pp.image();
         // have submitted to cmdbuf, otherwise this
         // image could be reused by the camera thread.
-        let src_image = &src_image_guard.frame;
         let dst_image = window.images[image_index as usize].clone();
         let [w, h, _] = src_image.extent();
         let [dw, dh, _] = dst_image.extent();
@@ -176,6 +175,7 @@ impl App {
         previous_future.cleanup_finished();
         let future = future
             .join(previous_future)
+            .join(pp_fut)
             .then_execute(self.queue.clone(), cmdbuf.build()?)?;
         window.inner.pre_present_notify();
 
@@ -245,7 +245,8 @@ fn main() -> Result<()> {
     let required_extensions = vulkano::swapchain::Surface::required_extensions(&event_loop)?;
     let (xr, _frame_waiter, _frame_stream) = xr::OpenXr::new(
         required_extensions,
-        Default::default(),
+        &Default::default(),
+        &[],
         APP_NAME,
         APP_VERSION,
     )?;
@@ -296,15 +297,7 @@ fn main() -> Result<()> {
     )?;
     log::info!("pipeline: {pp:?}");
     camera.set_params(&v4l::video::capture::Parameters::with_fps(54))?;
-    let splash = xr_passthrough_layer::config::load_splash(
-        device.clone(),
-        allocator.clone(),
-        cmdbuf_allocator.clone(),
-        queue.clone(),
-        SPLASH_IMAGE,
-    )?;
-
-    let camera = camera::CameraThread::new(camera, splash, Box::new(pp));
+    let camera = camera::CameraThread::new(camera, SPLASH_IMAGE);
 
     let proxy = event_loop.create_proxy();
     ctrlc::set_handler({
@@ -320,6 +313,7 @@ fn main() -> Result<()> {
         camera,
         cmdbuf_allocator,
         queue,
+        pp,
         instance: instance.clone(),
         previous_frame_end: Some(vulkano::sync::now(device).boxed()),
     };

@@ -6,17 +6,18 @@ pub mod pipeline;
 pub mod steam;
 pub mod utils;
 
-use std::sync::Arc;
-
 use anyhow::{anyhow, Context, Result};
 
 /// Camera image will be (size * 2, size)
 pub const CAMERA_SIZE: u32 = 960;
+use glam::UVec2;
 #[allow(unused_imports)]
 use log::info;
 pub struct FrameInfo {
-    pub frame: Arc<vulkano::image::Image>,
+    pub frame: Vec<u8>,
     pub frame_time: std::time::Instant,
+    pub size: UVec2,
+    pub needs_postprocess: bool,
 }
 
 pub fn find_index_camera() -> Result<std::path::PathBuf> {
