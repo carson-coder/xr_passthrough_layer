@@ -1,4 +1,4 @@
-use glam::{Mat4, Vec3, Vec4};
+use glam::{Mat4, Quat, Vec3, Vec4};
 use smallvec::smallvec;
 use std::{collections::HashSet, sync::Arc, thread::JoinHandle};
 use winit::{
@@ -197,6 +197,7 @@ struct App {
     xr_uniform_buffer: Subbuffer<vs::MVP>,
     frame_stream: openxr::FrameStream<openxr::Vulkan>,
     passthrough: Option<openxr::sys::PassthroughHTC>,
+    render_start: std::time::Instant,
 
     xr: xr::OpenXr,
 }
@@ -320,134 +321,14 @@ impl winit::application::ApplicationHandler<AppMessage> for App {
     fn user_event(&mut self, event_loop: &winit::event_loop::ActiveEventLoop, msg: AppMessage) {
         match msg {
             AppMessage::Frame(state) if !state.should_render => {
-                if self.state.is_stopped() {
-                    return;
+                if !self.state.is_stopped() {
+                    self.skip_frame(state).unwrap();
                 }
-                self.skip_frame(state).unwrap();
             }
             AppMessage::Frame(state) => {
-                if self.state.is_stopped() {
-                    return;
+                if !self.state.is_stopped() {
+                    self.render_and_submit(state).unwrap();
                 }
-                log::debug!("XR rendering");
-                self.queue.with(|_| self.frame_stream.begin().unwrap());
-                let (view_flags, views) = self
-                    .xr
-                    .xr_session()
-                    .locate_views(
-                        ViewConfigurationType::PRIMARY_STEREO,
-                        state.predicted_display_time,
-                        self.xr.space(),
-                    )
-                    .unwrap();
-                if !view_flags
-                    .contains(ViewStateFlags::POSITION_VALID | ViewStateFlags::ORIENTATION_VALID)
-                {
-                    log::warn!("View state is not valid");
-                    self.queue
-                        .with(|_| {
-                            self.frame_stream.end(
-                                state.predicted_display_time,
-                                EnvironmentBlendMode::OPAQUE,
-                                &[],
-                            )
-                        })
-                        .unwrap();
-                    return;
-                }
-                log::trace!("{:?}", views[0].fov);
-                log::trace!("{:?}", views[1].fov);
-                log::trace!("{:?}", views[0].pose);
-                log::trace!("{:?}", views[1].pose);
-                let render_size = self.xr.render_size();
-                let views = (&views[..]).try_into().unwrap();
-                let image_index = self
-                    .queue
-                    .with(|_| self.xr.swapchain().acquire_image())
-                    .unwrap() as _;
-                self.xr
-                    .swapchain()
-                    .wait_image(openxr::Duration::INFINITE)
-                    .unwrap();
-                self.render(image_index, views).unwrap();
-                let (swapchain, space) = self.xr.swapchain_space();
-                self.queue.with(|_| swapchain.release_image()).unwrap();
-                let views = [
-                    openxr::CompositionLayerProjectionView::new()
-                        .pose(views[0].pose)
-                        .fov(views[0].fov)
-                        .sub_image(
-                            SwapchainSubImage::new()
-                                .swapchain(swapchain)
-                                .image_array_index(0)
-                                .image_rect(Rect2Di {
-                                    offset: Offset2Di { x: 0, y: 0 },
-                                    extent: Extent2Di {
-                                        width: render_size.x as _,
-                                        height: render_size.y as _,
-                                    },
-                                }),
-                        ),
-                    openxr::CompositionLayerProjectionView::new()
-                        .pose(views[1].pose)
-                        .fov(views[1].fov)
-                        .sub_image(
-                            SwapchainSubImage::new()
-                                .swapchain(swapchain)
-                                .image_array_index(1)
-                                .image_rect(Rect2Di {
-                                    offset: Offset2Di { x: 0, y: 0 },
-                                    extent: Extent2Di {
-                                        width: render_size.x as _,
-                                        height: render_size.y as _,
-                                    },
-                                }),
-                        ),
-                ];
-
-                let layer = openxr::CompositionLayerProjection::new()
-                    .space(space)
-                    .layer_flags(CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA)
-                    .views(&views);
-                let layers: &[&openxr::CompositionLayerBase<_>] = if let Some(p) = self.passthrough
-                {
-                    let passthrough_layer = openxr::sys::CompositionLayerPassthroughHTC {
-                        ty: openxr::sys::CompositionLayerPassthroughHTC::TYPE,
-                        next: std::ptr::null(),
-                        // Spec: layer_flags must not be 0. don't know why, let's just use a
-                        // noop flag.
-                        layer_flags:
-                            openxr::sys::CompositionLayerFlags::CORRECT_CHROMATIC_ABERRATION,
-                        space: openxr::sys::Space::NULL,
-                        passthrough: p,
-                        color: openxr::sys::PassthroughColorHTC {
-                            ty: openxr::sys::PassthroughColorHTC::TYPE,
-                            next: std::ptr::null(),
-                            alpha: 1.0,
-                        },
-                    };
-                    // Safety: `openxr::CompositionLayerBase` is a transparent wrapper of
-                    // `openxr::sys::CompositionLayerBaseHeader`, which is a prefix of
-                    // `openxr::sys::CompositionLayerPassthroughHTC`.
-                    let passthrough_layer = unsafe {
-                        &*(&passthrough_layer as *const openxr::sys::CompositionLayerPassthroughHTC)
-                            .cast()
-                    };
-                    &[passthrough_layer, &layer]
-                } else {
-                    &[&layer]
-                };
-
-                self.queue
-                    .with(|_| {
-                        self.frame_stream.end(
-                            state.predicted_display_time,
-                            EnvironmentBlendMode::OPAQUE,
-                            layers,
-                        )
-                    })
-                    .unwrap();
-                log::debug!("XR rendering end");
             }
             AppMessage::WaiterExited(waiter) => {
                 log::info!("Frame waiter exited");
@@ -816,7 +697,7 @@ impl App {
         Ok(())
     }
     fn new(
-        xr: xr::OpenXr,
+        mut xr: xr::OpenXr,
         proxy: EventLoopProxy<AppMessage>,
         frame_waiter: openxr::FrameWaiter,
         frame_stream: openxr::FrameStream<openxr::Vulkan>,
@@ -824,8 +705,13 @@ impl App {
         let renderdoc = renderdoc::RenderDoc::<renderdoc::V141>::new()
             .map_err(|e| log::info!("cannot load renderdoc: {e}"))
             .ok();
-        let representative_image = &xr.images()[0];
         let (device, queue) = xr.vk_device();
+        let xr::RenderInfo {
+            swapchain_images,
+            depth_swapchain_images,
+            ..
+        } = xr.render_info();
+        let representative_image = &swapchain_images[0];
         let render_pass = RenderPass::new(
             device.clone(),
             RenderPassCreateInfo {
@@ -897,23 +783,6 @@ impl App {
                 .into_pipeline_layout_create_info(device.clone())?,
         )?;
         let extent = representative_image.extent();
-        let depth_image = Image::new(
-            allocator.clone(),
-            ImageCreateInfo {
-                format: vulkano::format::Format::D32_SFLOAT,
-                extent,
-                samples: representative_image.samples(),
-                array_layers: representative_image.array_layers(),
-                usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                allocate_preference: MemoryAllocatePreference::Unknown,
-                ..Default::default()
-            },
-        )?;
         let pipeline = GraphicsPipeline::new(
             device.clone(),
             None,
@@ -982,26 +851,54 @@ impl App {
             device.clone(),
             Default::default(),
         ));
-        let depth_image = ImageView::new(
-            depth_image.clone(),
-            ImageViewCreateInfo::from_image(&depth_image),
-        )?;
+        let depth_images: Vec<_> = if let Some(depth_images) = depth_swapchain_images {
+            depth_images
+                .iter()
+                .map(|i| ImageView::new(i.clone(), ImageViewCreateInfo::from_image(i)))
+                .collect::<Result<_, _>>()?
+        } else {
+            let depth_image = Image::new(
+                allocator.clone(),
+                ImageCreateInfo {
+                    format: vulkano::format::Format::D32_SFLOAT,
+                    extent,
+                    samples: representative_image.samples(),
+                    array_layers: representative_image.array_layers(),
+                    usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    allocate_preference: MemoryAllocatePreference::Unknown,
+                    ..Default::default()
+                },
+            )?;
+            let depth_image = ImageView::new(
+                depth_image.clone(),
+                ImageViewCreateInfo::from_image(&depth_image),
+            )?;
+            swapchain_images
+                .iter()
+                .map(|_| depth_image.clone())
+                .collect()
+        };
         let descriptor_set = DescriptorSet::new(
             descriptor_set_allocator.clone(),
             pipeline.layout().set_layouts().first().unwrap().clone(),
             [WriteDescriptorSet::buffer(0, mvp.clone())],
             [],
         )?;
-        let cmdbufs = xr
-            .images()
+        let cmdbufs = swapchain_images
             .iter()
-            .map(|i| {
+            .zip(depth_images.into_iter())
+            .map(|(i, di)| {
                 let framebuffer = Framebuffer::new(
                     render_pass.clone(),
                     FramebufferCreateInfo {
                         attachments: vec![
                             ImageView::new(i.clone(), ImageViewCreateInfo::from_image(i))?,
-                            depth_image.clone(),
+                            di,
                         ],
                         ..Default::default()
                     },
@@ -1067,9 +964,55 @@ impl App {
             xr,
             passthrough: None,
             frame_stream,
+            render_start: std::time::Instant::now(),
         })
     }
-    fn render(&mut self, index: usize, views: &[openxr::View; 2]) -> Result<()> {
+    fn render_and_submit(&mut self, state: FrameState) -> Result<()> {
+        log::debug!("XR rendering");
+        let delta = self.render_start.elapsed();
+        let xr::RenderInfo {
+            session: xr_session,
+            swapchain,
+            depth_swapchain,
+            space,
+            render_size,
+            ..
+        } = self.xr.render_info();
+        self.queue.with(|_| self.frame_stream.begin())?;
+        let (view_flags, views) = xr_session
+            .locate_views(
+                ViewConfigurationType::PRIMARY_STEREO,
+                state.predicted_display_time,
+                space,
+            )
+            .unwrap();
+        if !view_flags.contains(ViewStateFlags::POSITION_VALID | ViewStateFlags::ORIENTATION_VALID)
+        {
+            log::warn!("View state is not valid");
+            self.queue.with(|_| {
+                self.frame_stream.end(
+                    state.predicted_display_time,
+                    EnvironmentBlendMode::OPAQUE,
+                    &[],
+                )
+            })?;
+            return Ok(());
+        }
+        log::trace!("{:?}", views[0].fov);
+        log::trace!("{:?}", views[1].fov);
+        log::trace!("{:?}", views[0].pose);
+        log::trace!("{:?}", views[1].pose);
+        let views: [_; 2] = (&views[..]).try_into()?;
+        let image_index = self.queue.with(|_| swapchain.acquire_image())? as usize;
+        swapchain.wait_image(openxr::Duration::INFINITE).unwrap();
+        let depth_swapchain = depth_swapchain
+            .map(|sc| {
+                let i = self.queue.with(|_| sc.acquire_image())? as usize;
+                assert_eq!(i, image_index);
+                sc.wait_image(openxr::Duration::INFINITE)?;
+                Ok::<_, openxr::sys::Result>(sc)
+            })
+            .transpose()?;
         // Convert views to mvp
         self.latest_mvps = [0, 1].map(|i| {
             let view = views[i];
@@ -1088,15 +1031,15 @@ impl App {
             let r = view.fov.angle_right.tan();
             let t = view.fov.angle_up.tan();
             let b = view.fov.angle_down.tan();
-            let (near, far) = (0.1, 100.0);
+            let (near, far) = (0.05, 100.0);
             #[rustfmt::skip]
             let projection = Mat4::from_cols(
-                Vec4::new(2.0 / (r - l), 0.0          , (r + l) / (r - l)  , 0.0                     ),
-                Vec4::new(0.0          , -2.0 / (t - b), -(t + b) / (t - b)  , 0.0                     ),
-                Vec4::new(0.0          , 0.0          , -far / (far - near), -far*near / (far - near)),
-                Vec4::new(0.0          , 0.0          , -1.0               , 0.0                     ),
+                Vec4::new(2.0 / (r - l), 0.0           , (r + l) / (r - l)  , 0.0                     ),
+                Vec4::new(0.0          , -2.0 / (t - b), -(t + b) / (t - b) , 0.0                     ),
+                Vec4::new(0.0          , 0.0           , -far / (far - near), -far*near / (far - near)),
+                Vec4::new(0.0          , 0.0           , -1.0               , 0.0                     ),
             ).transpose(); // We gave the matrix in row major, so transpose it
-            let model = Mat4::from_translation(Vec3::new(0.0, 0.0, -1.0));
+            let model = Mat4::from_rotation_translation(Quat::from_axis_angle(Vec3::new(0., 1., 0.), (delta.as_millis() as f32) / 1000.), Vec3::new(0.0, 0.0, -1.0));
 
             projection * Mat4::from_rotation_translation(rotation, translation).inverse() * model
         });
@@ -1105,11 +1048,122 @@ impl App {
             mvp.mvps = self.latest_mvps.map(|m| m.to_cols_array_2d());
         };
 
-        self.xr_cmdbufs[index]
+        self.xr_cmdbufs[image_index]
             .clone()
             .execute(self.queue.clone())?
             .then_signal_fence_and_flush()?
             .wait(None)?;
+        self.queue.with(|_| swapchain.release_image())?;
+        let views = [
+            openxr::CompositionLayerProjectionView::new()
+                .pose(views[0].pose)
+                .fov(views[0].fov)
+                .sub_image(
+                    SwapchainSubImage::new()
+                        .swapchain(swapchain)
+                        .image_array_index(0)
+                        .image_rect(Rect2Di {
+                            offset: Offset2Di { x: 0, y: 0 },
+                            extent: Extent2Di {
+                                width: render_size.x as _,
+                                height: render_size.y as _,
+                            },
+                        }),
+                ),
+            openxr::CompositionLayerProjectionView::new()
+                .pose(views[1].pose)
+                .fov(views[1].fov)
+                .sub_image(
+                    SwapchainSubImage::new()
+                        .swapchain(swapchain)
+                        .image_array_index(1)
+                        .image_rect(Rect2Di {
+                            offset: Offset2Di { x: 0, y: 0 },
+                            extent: Extent2Di {
+                                width: render_size.x as _,
+                                height: render_size.y as _,
+                            },
+                        }),
+                ),
+        ];
+
+        let depths = if let Some(sc) = depth_swapchain {
+            let mut i = 0;
+            self.queue.with(|_| sc.release_image())?;
+            Some(views.each_ref().map(|_| {
+                let sub_img = SwapchainSubImage::new()
+                    .swapchain(sc)
+                    .image_array_index(i)
+                    .image_rect(Rect2Di {
+                        offset: Offset2Di { x: 0, y: 0 },
+                        extent: Extent2Di {
+                            width: render_size.x as _,
+                            height: render_size.y as _,
+                        },
+                    });
+                i += 1;
+                openxr::sys::CompositionLayerDepthInfoKHR {
+                    ty: openxr::sys::CompositionLayerDepthInfoKHR::TYPE,
+                    next: std::ptr::null(),
+                    sub_image: sub_img.into_raw(),
+                    max_depth: 1.0,
+                    min_depth: 0.0,
+                    near_z: 0.05,
+                    far_z: 100.0,
+                }
+            }))
+        } else {
+            None
+        };
+        let views = if let Some(depths) = &depths {
+            let mut i = 0;
+            views.map(|v| {
+                let mut v = v.into_raw();
+                v.next = &depths[i] as *const _ as *const _;
+                i += 1;
+                unsafe { openxr::CompositionLayerProjectionView::from_raw(v) }
+            })
+        } else {
+            views
+        };
+        let layer = openxr::CompositionLayerProjection::new()
+            .space(space)
+            .layer_flags(CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA)
+            .views(&views);
+        let layers: &[&openxr::CompositionLayerBase<_>] = if let Some(p) = self.passthrough {
+            let passthrough_layer = openxr::sys::CompositionLayerPassthroughHTC {
+                ty: openxr::sys::CompositionLayerPassthroughHTC::TYPE,
+                next: std::ptr::null(),
+                // Spec: layer_flags must not be 0. don't know why, let's just use a
+                // noop flag.
+                layer_flags: openxr::sys::CompositionLayerFlags::CORRECT_CHROMATIC_ABERRATION,
+                space: openxr::sys::Space::NULL,
+                passthrough: p,
+                color: openxr::sys::PassthroughColorHTC {
+                    ty: openxr::sys::PassthroughColorHTC::TYPE,
+                    next: std::ptr::null(),
+                    alpha: 1.0,
+                },
+            };
+            // Safety: `openxr::CompositionLayerBase` is a transparent wrapper of
+            // `openxr::sys::CompositionLayerBaseHeader`, which is a prefix of
+            // `openxr::sys::CompositionLayerPassthroughHTC`.
+            let passthrough_layer = unsafe {
+                &*(&passthrough_layer as *const openxr::sys::CompositionLayerPassthroughHTC).cast()
+            };
+            &[passthrough_layer, &layer]
+        } else {
+            &[&layer]
+        };
+
+        self.queue.with(|_| {
+            self.frame_stream.end(
+                state.predicted_display_time,
+                EnvironmentBlendMode::OPAQUE,
+                layers,
+            )
+        })?;
+        log::debug!("XR rendering end");
         Ok(())
     }
 }
@@ -1152,6 +1206,10 @@ fn main() -> Result<()> {
                 break;
             }
         }
+    }
+    if supported_xr_extensions.khr_composition_layer_depth {
+        log::info!("Has KHR composition layer depth extension");
+        xr_extensions.khr_composition_layer_depth = true;
     }
     //xr_extensions.htc_passthrough = true;
     let (xr, frame_waiter, frame_stream) = xr::OpenXr::new(

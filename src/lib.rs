@@ -6,7 +6,7 @@ pub mod pipeline;
 pub mod steam;
 pub mod utils;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 /// Camera image will be (size * 2, size)
 pub const CAMERA_SIZE: u32 = 960;

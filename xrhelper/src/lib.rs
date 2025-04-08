@@ -42,6 +42,8 @@ pub struct OpenXr {
     space: openxr::Space,
     swapchain_images: Vec<Arc<Image>>,
     swapchain: openxr::Swapchain<openxr::Vulkan>,
+    depth_swapchain_images: Option<Vec<Arc<Image>>>,
+    depth_swapchain: Option<openxr::Swapchain<openxr::Vulkan>>,
     session: openxr::Session<openxr::Vulkan>,
     instance: openxr::Instance,
 
@@ -81,6 +83,16 @@ pub fn posef_to_nalgebra(posef: openxr::Posef) -> (UnitQuaternion<f32>, nalgebra
     let translation: nalgebra::Vector3<f32> =
         [posef.position.x, posef.position.y, posef.position.z].into();
     (quaternion, translation)
+}
+
+pub struct RenderInfo<'a> {
+    pub session: &'a openxr::Session<openxr::Vulkan>,
+    pub swapchain: &'a mut openxr::Swapchain<openxr::Vulkan>,
+    pub swapchain_images: &'a Vec<Arc<Image>>,
+    pub depth_swapchain: Option<&'a mut openxr::Swapchain<openxr::Vulkan>>,
+    pub depth_swapchain_images: Option<&'a Vec<Arc<Image>>>,
+    pub space: &'a openxr::Space,
+    pub render_size: UVec2,
 }
 
 impl OpenXr {
@@ -388,7 +400,7 @@ impl OpenXr {
             mip_count: 1,
         })?;
         log::debug!("created swapchain");
-        let swapchain_images = swapchain
+        let swapchain_images: Vec<_> = swapchain
             .enumerate_images()?
             .into_iter()
             .map(|handle| {
@@ -411,6 +423,65 @@ impl OpenXr {
                 Ok::<_, anyhow::Error>(Arc::new(image))
             })
             .try_collect()?;
+        let (depth_swapchain, depth_swapchain_images) =
+            if instance.exts().khr_composition_layer_depth.is_some() {
+                const PREFERRED_DEPTH_FORMATS: [vulkano::format::Format; 5] = [
+                    vulkano::format::Format::D32_SFLOAT,
+                    vulkano::format::Format::D16_UNORM,
+                    vulkano::format::Format::D32_SFLOAT_S8_UINT,
+                    vulkano::format::Format::D24_UNORM_S8_UINT,
+                    vulkano::format::Format::D16_UNORM_S8_UINT,
+                ];
+                if let Some(format) = PREFERRED_DEPTH_FORMATS
+                    .iter()
+                    .find(|f| formats.contains(f))
+                    .copied()
+                {
+                    let depth_swapchain =
+                        session.create_swapchain(&openxr::SwapchainCreateInfo {
+                            array_size: 2,
+                            face_count: 1,
+                            create_flags: Default::default(),
+                            usage_flags: openxr::SwapchainUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+                            format: format as u32,
+                            sample_count,
+                            width,
+                            height,
+                            mip_count: 1,
+                        })?;
+                    log::debug!("created depth swapchain");
+                    let depth_swapchain_images: Vec<_> = depth_swapchain
+                        .enumerate_images()?
+                        .into_iter()
+                        .map(|handle| {
+                            let handle = ash::vk::Image::from_raw(handle);
+                            let raw_image = unsafe {
+                                vulkano::image::sys::RawImage::from_handle_borrowed(
+                                    device.clone(),
+                                    handle,
+                                    ImageCreateInfo {
+                                        format,
+                                        array_layers: 2,
+                                        extent: [width, height, 1],
+                                        usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT,
+                                        ..Default::default()
+                                    },
+                                )?
+                            };
+                            // SAFETY: OpenXR guarantees that the image is a swapchain image, thus has memory backing it.
+                            let image = unsafe { raw_image.assume_bound() };
+                            Ok::<_, anyhow::Error>(Arc::new(image))
+                        })
+                        .try_collect()?;
+                    assert_eq!(depth_swapchain_images.len(), swapchain_images.len());
+                    (Some(depth_swapchain), Some(depth_swapchain_images))
+                } else {
+                    log::warn!("No suitable depth format found for swapchain");
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
         log::debug!("got swapchain images");
         let space =
             session.create_reference_space(ReferenceSpaceType::STAGE, openxr::Posef::IDENTITY)?;
@@ -421,6 +492,8 @@ impl OpenXr {
                 session,
                 swapchain,
                 swapchain_images,
+                depth_swapchain,
+                depth_swapchain_images,
                 space,
 
                 vk_instance,
@@ -433,8 +506,16 @@ impl OpenXr {
             frame_stream,
         ))
     }
-    pub fn images(&self) -> &Vec<Arc<Image>> {
-        &self.swapchain_images
+    pub fn render_info(&mut self) -> RenderInfo {
+        RenderInfo {
+            session: &self.session,
+            swapchain: &mut self.swapchain,
+            swapchain_images: &self.swapchain_images,
+            depth_swapchain: self.depth_swapchain.as_mut(),
+            depth_swapchain_images: self.depth_swapchain_images.as_ref(),
+            space: &self.space,
+            render_size: self.render_size,
+        }
     }
     pub fn vk_device(&self) -> (Arc<Device>, Arc<Queue>) {
         (self.device.clone(), self.queue.clone())
@@ -447,15 +528,6 @@ impl OpenXr {
     }
     pub fn xr_session(&self) -> &openxr::Session<openxr::Vulkan> {
         &self.session
-    }
-    pub fn swapchain_space(&mut self) -> (&mut openxr::Swapchain<openxr::Vulkan>, &openxr::Space) {
-        (&mut self.swapchain, &self.space)
-    }
-    pub fn space(&self) -> &openxr::Space {
-        &self.space
-    }
-    pub fn swapchain(&mut self) -> &mut openxr::Swapchain<openxr::Vulkan> {
-        &mut self.swapchain
     }
     pub fn render_size(&self) -> UVec2 {
         self.render_size

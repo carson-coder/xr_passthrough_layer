@@ -1,10 +1,10 @@
 use std::{
-    sync::{mpsc, Arc},
+    sync::{Arc, mpsc},
     thread::JoinHandle,
 };
 
 use super::FrameInfo;
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use arc_swap::{ArcSwap, Guard};
 use glam::UVec2;
 use log::{info as debug, warn};

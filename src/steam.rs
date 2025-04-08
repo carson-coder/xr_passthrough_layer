@@ -51,7 +51,7 @@ pub struct StereoCamera {
 pub struct LighthouseConfig {
     pub tracked_cameras: Vec<TrackedCamera>,
 }
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 /// Try to find the config file for index
 pub fn find_steam_config() -> Option<StereoCamera> {
     let xdg = xdg::BaseDirectories::new().ok()?;

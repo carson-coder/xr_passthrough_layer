@@ -1,18 +1,18 @@
 use std::sync::Arc;
 
 use vulkano::{
+    Validated,
     buffer::{AllocateBufferError, Buffer, BufferCreateInfo, RawBuffer},
     device::Device,
-    image::{sys::RawImage, AllocateImageError, Image, ImageCreateFlags, ImageCreateInfo},
+    image::{AllocateImageError, Image, ImageCreateFlags, ImageCreateInfo, sys::RawImage},
     memory::{
+        DedicatedAllocation, DeviceMemory, MemoryAllocateInfo, MemoryMapInfo, MemoryPropertyFlags,
+        MemoryRequirements, ResourceMemory,
         allocator::{
             FreeListAllocator, GenericMemoryAllocator, GenericMemoryAllocatorCreateInfo,
             MemoryAllocator, MemoryAllocatorError, MemoryTypeFilter,
         },
-        DedicatedAllocation, DeviceMemory, MemoryAllocateInfo, MemoryMapInfo, MemoryPropertyFlags,
-        MemoryRequirements, ResourceMemory,
     },
-    Validated,
 };
 
 pub trait DeviceExt {
@@ -167,7 +167,9 @@ impl DeviceExt for Device {
             .enumerate()
             .map(|(index, &size)| if size != 0 { 1 << index } else { 0 })
             .sum();
-        log::debug!("host_to_device_allocator: block_sizes={block_sizes:?}, memory_type_bits={memory_type_bits:#b}");
+        log::debug!(
+            "host_to_device_allocator: block_sizes={block_sizes:?}, memory_type_bits={memory_type_bits:#b}"
+        );
         GenericMemoryAllocator::new(
             self.clone(),
             GenericMemoryAllocatorCreateInfo {
