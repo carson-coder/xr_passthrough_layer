@@ -2,7 +2,7 @@
 rustflags = [ "-Cforce-frame-pointers=yes" ]
 
 [patch.crates-io]
-openxr = { path = "./openxrs/openxr" }
+openxr = { git = "https://github.com/yshui-forks/openxrs", branch = "dev" }
 vulkano = { git = "https://github.com/vulkano-rs/vulkano" }
 
 [alias]
