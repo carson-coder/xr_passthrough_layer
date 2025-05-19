@@ -18,19 +18,19 @@ use vulkano::{
 pub trait DeviceExt {
     type HostToDeviceAllocator: MemoryAllocator;
     fn new_image(
-        self: Arc<Self>,
-        create_info: ImageCreateInfo,
+        self: &Arc<Self>,
+        create_info: &ImageCreateInfo<'_>,
         filter: MemoryTypeFilter,
     ) -> Result<Arc<Image>, Validated<AllocateImageError>>;
     fn new_buffer(
-        self: Arc<Self>,
-        create_info: BufferCreateInfo,
+        self: &Arc<Self>,
+        create_info: &BufferCreateInfo<'_>,
         filter: MemoryTypeFilter,
     ) -> Result<Arc<Buffer>, Validated<AllocateBufferError>>;
 
     /// An allocator used to allocate a small amount of memory intended for host-to-device upload,
     /// e.g. small vertex buffers, uniform buffers, etc.
-    fn host_to_device_allocator(self: Arc<Self>) -> Self::HostToDeviceAllocator;
+    fn host_to_device_allocator(self: &Arc<Self>) -> Self::HostToDeviceAllocator;
 }
 
 fn dedicated_allocation_memory_requirements(
@@ -69,7 +69,7 @@ fn find_memory_type_index(
 }
 
 fn allocate_dedicated(
-    device: Arc<Device>,
+    device: &Arc<Device>,
     dedicate_allocation: DedicatedAllocation<'_>,
     filter: MemoryTypeFilter,
     should_map: bool,
@@ -79,8 +79,8 @@ fn allocate_dedicated(
         find_memory_type_index(device.clone(), memory_requirements.memory_type_bits, filter)
             .ok_or(MemoryAllocatorError::FindMemoryType)?;
     let mut device_memory = DeviceMemory::allocate(
-        device.clone(),
-        MemoryAllocateInfo {
+        device,
+        &MemoryAllocateInfo {
             allocation_size: memory_requirements.layout.size(),
             dedicated_allocation: Some(dedicate_allocation),
             memory_type_index,
@@ -90,7 +90,7 @@ fn allocate_dedicated(
     .map_err(MemoryAllocatorError::AllocateDeviceMemory)?;
     if should_map {
         device_memory
-            .map(MemoryMapInfo {
+            .map(&MemoryMapInfo {
                 offset: 0,
                 size: device_memory.allocation_size(),
                 ..Default::default()
@@ -103,45 +103,37 @@ fn allocate_dedicated(
 impl DeviceExt for Device {
     type HostToDeviceAllocator = GenericMemoryAllocator<FreeListAllocator>;
     fn new_image(
-        self: Arc<Self>,
-        create_info: ImageCreateInfo,
+        self: &Arc<Self>,
+        create_info: &ImageCreateInfo<'_>,
         filter: MemoryTypeFilter,
     ) -> Result<Arc<Image>, Validated<AllocateImageError>> {
         assert!(!create_info.flags.intersects(ImageCreateFlags::DISJOINT));
-        let raw_image = RawImage::new(self.clone(), create_info)
-            .map_err(|x| x.map(AllocateImageError::CreateImage))?;
-        let resource_memory = allocate_dedicated(
-            self.clone(),
-            DedicatedAllocation::Image(&raw_image),
-            filter,
-            false,
-        )
-        .map_err(|x| Validated::Error(AllocateImageError::AllocateMemory(x)))?;
+        let raw_image =
+            RawImage::new(self, create_info).map_err(|x| x.map(AllocateImageError::CreateImage))?;
+        let resource_memory =
+            allocate_dedicated(self, DedicatedAllocation::Image(&raw_image), filter, false)
+                .map_err(|x| Validated::Error(AllocateImageError::AllocateMemory(x)))?;
         raw_image
             .bind_memory(Some(resource_memory))
             .map_err(|(x, _, _)| x.map(AllocateImageError::BindMemory))
             .map(Arc::new)
     }
     fn new_buffer(
-        self: Arc<Self>,
-        create_info: BufferCreateInfo,
+        self: &Arc<Self>,
+        create_info: &BufferCreateInfo<'_>,
         filter: MemoryTypeFilter,
     ) -> Result<Arc<Buffer>, Validated<AllocateBufferError>> {
-        let buffer = RawBuffer::new(self.clone(), create_info)
+        let buffer = RawBuffer::new(self, create_info)
             .map_err(|x| x.map(AllocateBufferError::CreateBuffer))?;
-        let resource_memory = allocate_dedicated(
-            self.clone(),
-            DedicatedAllocation::Buffer(&buffer),
-            filter,
-            true,
-        )
-        .map_err(|x| Validated::Error(AllocateBufferError::AllocateMemory(x)))?;
+        let resource_memory =
+            allocate_dedicated(self, DedicatedAllocation::Buffer(&buffer), filter, true)
+                .map_err(|x| Validated::Error(AllocateBufferError::AllocateMemory(x)))?;
         buffer
             .bind_memory(resource_memory)
             .map_err(|(x, _, _)| x.map(AllocateBufferError::BindMemory))
             .map(Arc::new)
     }
-    fn host_to_device_allocator(self: Arc<Self>) -> Self::HostToDeviceAllocator {
+    fn host_to_device_allocator(self: &Arc<Self>) -> Self::HostToDeviceAllocator {
         // Find a memory type suitable for host-to-device upload.
         let block_sizes: Vec<_> = self
             .physical_device()
@@ -171,8 +163,8 @@ impl DeviceExt for Device {
             "host_to_device_allocator: block_sizes={block_sizes:?}, memory_type_bits={memory_type_bits:#b}"
         );
         GenericMemoryAllocator::new(
-            self.clone(),
-            GenericMemoryAllocatorCreateInfo {
+            self,
+            &GenericMemoryAllocatorCreateInfo {
                 block_sizes: &block_sizes,
                 memory_type_bits,
                 ..Default::default()

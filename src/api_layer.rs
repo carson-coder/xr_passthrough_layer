@@ -18,15 +18,9 @@ use std::{
 use vulkano::{
     command_buffer::{
         AutoCommandBufferBuilder, BlitImageInfo, CommandBufferUsage, ImageBlit,
-        allocator::{
-            CommandBufferAllocator, StandardCommandBufferAllocator,
-            StandardCommandBufferAllocatorCreateInfo,
-        },
+        allocator::{CommandBufferAllocator, StandardCommandBufferAllocator},
     },
-    descriptor_set::allocator::{
-        DescriptorSetAllocator, StandardDescriptorSetAllocator,
-        StandardDescriptorSetAllocatorCreateInfo,
-    },
+    descriptor_set::allocator::{DescriptorSetAllocator, StandardDescriptorSetAllocator},
     device::QueueCreateInfo,
     image::{ImageCreateInfo, ImageLayout, ImageUsage},
     memory::allocator::{MemoryAllocator, StandardMemoryAllocator},
@@ -414,11 +408,11 @@ unsafe impl quark::Factory<PassthroughData> for PassthroughFactory {
                         session,
                         inner.system_id,
                         view_type.unwrap(),
-                        inner.device.clone(),
-                        inner.queue.clone(),
-                        inner.allocator.clone(),
-                        inner.cmdbuf_allocator.clone(),
-                        inner.descriptor_set_allocator.clone(),
+                        &inner.device,
+                        &inner.queue,
+                        &inner.allocator,
+                        &inner.cmdbuf_allocator,
+                        &inner.descriptor_set_allocator,
                     )
                 },
             )?
@@ -521,7 +515,7 @@ unsafe fn get_vulkan_extensions_override(
         buffer.copy_from_nonoverlapping(buf.as_ptr() as *const _, buf.len());
         let mut pos = buffer.add(buf.len());
         for e in extra_extensions {
-            if pos != buffer {
+            if !std::ptr::eq(pos, buffer) {
                 pos.write(b' ' as _);
                 pos = pos.add(1);
             }
@@ -801,24 +795,25 @@ impl quark::Hook for SessionData {
                 (req.min_api_version_supported.into_raw() as u32).into()
             };
             log::info!("Vulkan API version: {api_version}");
+            let enabled_vk_instance_extensions = REQUIRED_VK_INSTANCE_EXTENSIONS
+                .iter()
+                .map(|&e| e.to_str().unwrap())
+                .collect();
             let vk_create_info = vulkano::instance::InstanceCreateInfo {
-                enabled_extensions: REQUIRED_VK_INSTANCE_EXTENSIONS
-                    .iter()
-                    .map(|&e| e.to_str().unwrap())
-                    .collect(),
+                enabled_extensions: &enabled_vk_instance_extensions,
                 max_api_version: Some(api_version),
                 ..Default::default()
             };
             let vk_instance = unsafe {
                 vulkano::instance::Instance::from_handle_borrowed(
-                    VULKAN_LIBRARY.clone(),
+                    &VULKAN_LIBRARY,
                     ash::vk::Handle::from_raw(gb.instance as usize as u64),
-                    vk_create_info,
+                    &vk_create_info,
                 )
             };
             let physical_device = match unsafe {
                 vulkano::device::physical::PhysicalDevice::from_handle(
-                    vk_instance.clone(),
+                    &vk_instance,
                     ash::vk::Handle::from_raw(gb.physical_device as usize as u64),
                 )
             } {
@@ -828,23 +823,25 @@ impl quark::Hook for SessionData {
                     return Ok(Self::default());
                 }
             };
+            let queues = vec![0.0; gb.queue_index as usize + 1];
+            let enabled_vk_device_extensions = REQUIRED_VK_DEVICE_EXTENSIONS
+                .iter()
+                .map(|&e| e.to_str().unwrap())
+                .collect();
             let vk_create_info = vulkano::device::DeviceCreateInfo {
-                queue_create_infos: vec![QueueCreateInfo {
+                queue_create_infos: &[QueueCreateInfo {
                     queue_family_index: gb.queue_family_index,
-                    queues: vec![0.0; gb.queue_index as usize + 1],
+                    queues: &queues,
                     ..Default::default()
                 }],
-                enabled_extensions: REQUIRED_VK_DEVICE_EXTENSIONS
-                    .iter()
-                    .map(|&e| e.to_str().unwrap())
-                    .collect(),
+                enabled_extensions: &enabled_vk_device_extensions,
                 ..Default::default()
             };
             let (device, mut queue) = unsafe {
                 vulkano::device::Device::from_handle_borrowed(
-                    physical_device,
+                    &physical_device,
                     ash::vk::Handle::from_raw(gb.device as usize as u64),
-                    vk_create_info,
+                    &vk_create_info,
                 )
             };
             let Some(queue) = queue.nth(gb.queue_index as _) else {
@@ -852,14 +849,14 @@ impl quark::Hook for SessionData {
                 return Ok(Self::default());
             };
 
-            let allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
+            let allocator = Arc::new(StandardMemoryAllocator::new(&device, &Default::default()));
             let cmdbuf_allocator = Arc::new(StandardCommandBufferAllocator::new(
-                device.clone(),
-                StandardCommandBufferAllocatorCreateInfo::default(),
+                &device,
+                &Default::default(),
             ));
             let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
-                device.clone(),
-                StandardDescriptorSetAllocatorCreateInfo::default(),
+                &device,
+                &Default::default(),
             ));
             let space = xr_vk_session
                 .create_reference_space(ReferenceSpaceType::STAGE, openxr::Posef::IDENTITY)?;
@@ -893,11 +890,11 @@ fn create_camera_resources(
     session: &openxr::Session<openxr::Vulkan>,
     system_id: openxr::sys::SystemId,
     view_type: openxr::sys::ViewConfigurationType,
-    device: Arc<vulkano::device::Device>,
-    queue: Arc<vulkano::device::Queue>,
-    allocator: Arc<dyn MemoryAllocator>,
-    cmdbuf_allocator: Arc<dyn CommandBufferAllocator>,
-    descriptor_set_allocator: Arc<dyn DescriptorSetAllocator>,
+    device: &Arc<vulkano::device::Device>,
+    queue: &Arc<vulkano::device::Queue>,
+    allocator: &Arc<dyn MemoryAllocator>,
+    cmdbuf_allocator: &Arc<dyn CommandBufferAllocator>,
+    descriptor_set_allocator: &Arc<dyn DescriptorSetAllocator>,
 ) -> Result<CameraResources, XrErr> {
     let cfgs = instance.enumerate_view_configuration_views(system_id, view_type)?;
     if cfgs.len() != 1 && cfgs.len() != 2 {
@@ -907,7 +904,7 @@ fn create_camera_resources(
         warn!("xdg: {e:#}");
         XrErr::ERROR_RUNTIME_FAILURE
     })?;
-    let pipeline_cache = crate::config::load_pipeline_cache(device.clone(), &xdg).map_err(|e| {
+    let pipeline_cache = crate::config::load_pipeline_cache(device, &xdg).map_err(|e| {
         warn!("Failed to load pipeline cache {e:#}");
         XrErr::ERROR_RUNTIME_FAILURE
     })?;
@@ -919,10 +916,10 @@ fn create_camera_resources(
         .max(cfgs[1].recommended_image_rect_height);
 
     let pp = crate::pipeline::Pipeline::new(
-        device.clone(),
-        allocator.clone(),
-        cmdbuf_allocator.clone(),
-        queue.clone(),
+        device,
+        allocator,
+        cmdbuf_allocator,
+        queue,
         descriptor_set_allocator,
         true,
         *CAMERA_CONFIG,
@@ -986,9 +983,9 @@ fn create_camera_resources(
         .map(|raw_img| unsafe {
             Ok::<_, XrErr>(Arc::new(
                 vulkano::image::sys::RawImage::from_handle_borrowed(
-                    device.clone(),
+                    device,
                     ash::vk::Image::from_raw(raw_img),
-                    ImageCreateInfo {
+                    &ImageCreateInfo {
                         format,
                         extent: [width * 2, height, 1],
                         array_layers: 1,
@@ -1049,11 +1046,11 @@ unsafe extern "system" fn begin_session(
                 xr_vk_session,
                 data.system_id,
                 info.primary_view_configuration_type,
-                data.device.clone(),
-                data.queue.clone(),
-                data.allocator.clone(),
-                data.cmdbuf_allocator.clone(),
-                data.descriptor_set_allocator.clone()
+                &data.device,
+                &data.queue,
+                &data.allocator,
+                &data.cmdbuf_allocator,
+                &data.descriptor_set_allocator
             ));
             SessionState::RunningWithPassthrough {
                 camera,

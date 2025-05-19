@@ -244,11 +244,11 @@ impl Pipeline {
     /// The camera image is two `size` images stitched together side-by-side.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        device: Arc<Device>,
-        allocator: Arc<dyn MemoryAllocator>,
-        cmdbuf_allocator: Arc<dyn CommandBufferAllocator>,
-        queue: Arc<Queue>,
-        descriptor_set_allocator: Arc<dyn DescriptorSetAllocator>,
+        device: &Arc<Device>,
+        allocator: &Arc<dyn MemoryAllocator>,
+        cmdbuf_allocator: &Arc<dyn CommandBufferAllocator>,
+        queue: &Arc<Queue>,
+        descriptor_set_allocator: &Arc<dyn DescriptorSetAllocator>,
         source_is_yuyv: bool,
         camera_config: Option<StereoCamera>,
         final_layout: ImageLayout,
@@ -284,8 +284,8 @@ impl Pipeline {
         let fs_main = fs.entry_point("main").unwrap();
 
         // Allocate intermediate textures
-        let input_texture = device.clone().new_image(
-            ImageCreateInfo {
+        let input_texture = device.new_image(
+            &ImageCreateInfo {
                 extent: if source_is_yuyv && !has_yuyv_sampler {
                     // Source is raw, unconverted yuyv, therefore is downsampled 2x in the X
                     // direction.
@@ -302,8 +302,8 @@ impl Pipeline {
             },
             MemoryTypeFilter::PREFER_DEVICE,
         )?;
-        let postprocessed_image = device.clone().new_image(
-            ImageCreateInfo {
+        let postprocessed_image = device.new_image(
+            &ImageCreateInfo {
                 extent: [render_size.x * 2, render_size.y, 1],
                 format: Format::R8G8B8A8_UNORM,
                 usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_DST | output_usage,
@@ -311,8 +311,8 @@ impl Pipeline {
             },
             MemoryTypeFilter::PREFER_DEVICE,
         )?;
-        let cpu_buffer = device.clone().new_buffer(
-            BufferCreateInfo {
+        let cpu_buffer = device.new_buffer(
+            &BufferCreateInfo {
                 usage: BufferUsage::TRANSFER_SRC,
                 size: camera_size.x as u64
                     * camera_size.y as u64
@@ -355,22 +355,23 @@ impl Pipeline {
                 .into_pipeline_layout_create_info(device.clone())?,
         )?;
         let sampler = Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
+            device,
+            &SamplerCreateInfo {
                 min_filter: Filter::Linear,
                 mag_filter: Filter::Linear,
                 sampler_ycbcr_conversion: has_yuyv_sampler
                     .then(|| {
                         SamplerYcbcrConversion::new(
-                            device.clone(),
-                            SamplerYcbcrConversionCreateInfo {
+                            device,
+                            &SamplerYcbcrConversionCreateInfo {
                                 format,
                                 ycbcr_model: SamplerYcbcrModelConversion::Ycbcr709,
                                 ..Default::default()
                             },
                         )
                     })
-                    .transpose()?,
+                    .transpose()?
+                    .as_ref(),
                 ..Default::default()
             },
         )?;
@@ -378,12 +379,12 @@ impl Pipeline {
             .as_ref()
             .map(|c| {
                 Buffer::from_data(
-                    allocator.clone(),
-                    BufferCreateInfo {
+                    allocator,
+                    &BufferCreateInfo {
                         usage: BufferUsage::UNIFORM_BUFFER,
                         ..Default::default()
                     },
-                    AllocationCreateInfo {
+                    &AllocationCreateInfo {
                         memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE
                             | MemoryTypeFilter::PREFER_DEVICE,
                         allocate_preference: MemoryAllocatePreference::Unknown,
@@ -430,8 +431,8 @@ impl Pipeline {
         let desc_set_writes = [WriteDescriptorSet::image_view_sampler(
             1,
             ImageView::new(
-                input_texture.clone(),
-                ImageViewCreateInfo::from_image(&input_texture),
+                &input_texture,
+                &ImageViewCreateInfo::from_image(&input_texture),
             )?,
             sampler.clone(),
         )]
@@ -442,12 +443,12 @@ impl Pipeline {
                 .map(|b| WriteDescriptorSet::buffer(2, b)),
         );
         let vertices = Buffer::from_iter::<Vertex, _>(
-            allocator.clone(),
-            BufferCreateInfo {
+            allocator,
+            &BufferCreateInfo {
                 usage: BufferUsage::VERTEX_BUFFER,
                 ..Default::default()
             },
-            AllocationCreateInfo {
+            &AllocationCreateInfo {
                 memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE
                     | MemoryTypeFilter::PREFER_DEVICE,
                 allocate_preference: MemoryAllocatePreference::Unknown,
@@ -483,7 +484,7 @@ impl Pipeline {
         let framebuffer = Framebuffer::new(
             render_pass.clone(),
             vulkano::render_pass::FramebufferCreateInfo {
-                attachments: vec![ImageView::new(postprocessed_image.clone(), ivci)?],
+                attachments: vec![ImageView::new(&postprocessed_image, &ivci)?],
                 ..Default::default()
             },
         )?;
@@ -526,11 +527,11 @@ impl Pipeline {
             postprocessed_image,
             previous_upload_end: None,
             previous_frame_time: None,
-            device,
-            allocator,
+            device: device.clone(),
+            allocator: allocator.clone(),
             cmdbuf,
-            cmdbuf_allocator,
-            queue,
+            cmdbuf_allocator: cmdbuf_allocator.clone(),
+            queue: queue.clone(),
         })
     }
     pub fn fov(&self) -> [Vec2; 2] {
@@ -577,12 +578,12 @@ impl Pipeline {
                 frame.size.x as usize * 2 * frame.size.y as usize * 4
             );
             let buffer = Buffer::new_slice::<u8>(
-                self.allocator.clone(),
-                BufferCreateInfo {
+                &self.allocator,
+                &BufferCreateInfo {
                     usage: BufferUsage::TRANSFER_SRC,
                     ..Default::default()
                 },
-                AllocationCreateInfo {
+                &AllocationCreateInfo {
                     memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE
                         | MemoryTypeFilter::PREFER_DEVICE,
                     allocate_preference: MemoryAllocatePreference::Unknown,
@@ -591,8 +592,8 @@ impl Pipeline {
                 frame.size.x as u64 * 2 * frame.size.y as u64 * 4,
             )?;
             buffer.write()?.copy_from_slice(&frame.frame);
-            let vkimg = self.device.clone().new_image(
-                ImageCreateInfo {
+            let vkimg = self.device.new_image(
+                &ImageCreateInfo {
                     format: vulkano::format::Format::R8G8B8A8_UNORM,
                     extent: [frame.size.x * 2, frame.size.y, 1],
                     usage: ImageUsage::TRANSFER_DST

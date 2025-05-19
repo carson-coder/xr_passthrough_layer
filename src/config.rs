@@ -63,7 +63,7 @@ use vulkano::{
     device::Queue,
     image::{ImageCreateInfo, ImageUsage},
     memory::allocator::{AllocationCreateInfo, MemoryAllocator, MemoryTypeFilter},
-    pipeline::cache::{PipelineCache, PipelineCacheCreateInfo},
+    pipeline::cache::{PipelineCache, PipelineCacheCreateInfo, PipelineCacheData},
     sync::GpuFuture as _,
 };
 use xdg::BaseDirectories;
@@ -129,7 +129,7 @@ impl Drop for AutoSavingPipelineCache {
 /// Load pipeline cache from file, if file not found or fails validation, create empty
 /// PipelineCache.
 pub fn load_pipeline_cache(
-    device: Arc<vulkano::device::Device>,
+    device: &Arc<vulkano::device::Device>,
     xdg: &BaseDirectories,
 ) -> Result<Arc<PipelineCache>> {
     if let Some(data) = xdg
@@ -152,25 +152,24 @@ pub fn load_pipeline_cache(
             Some(data)
         })
     {
-        unsafe {
-            PipelineCache::new(
-                device,
-                PipelineCacheCreateInfo {
-                    initial_data: data,
-                    ..Default::default()
-                },
-            )
-        }
+        PipelineCache::new(
+            device.clone(),
+            PipelineCacheCreateInfo {
+                // SAFETY: we validated the signature
+                initial_data: Some(unsafe { PipelineCacheData::new(data) }),
+                ..Default::default()
+            },
+        )
     } else {
-        unsafe { PipelineCache::new(device, PipelineCacheCreateInfo::default()) }
+        PipelineCache::new(device.clone(), PipelineCacheCreateInfo::default())
     }
     .map_err(Into::into)
 }
 pub fn load_splash(
-    device: Arc<vulkano::device::Device>,
-    allocator: Arc<dyn MemoryAllocator>,
-    cmdbuf_allocator: Arc<dyn CommandBufferAllocator>,
-    queue: Arc<Queue>,
+    device: &Arc<vulkano::device::Device>,
+    allocator: &Arc<dyn MemoryAllocator>,
+    cmdbuf_allocator: &Arc<dyn CommandBufferAllocator>,
+    queue: &Arc<Queue>,
     data: &[u8],
 ) -> Result<Arc<vulkano::image::Image>> {
     log::debug!("loading splash");
@@ -180,7 +179,7 @@ pub fn load_splash(
 
     log::debug!("splash loaded");
     let vkimg = device.new_image(
-        ImageCreateInfo {
+        &ImageCreateInfo {
             format: vulkano::format::Format::R8G8B8A8_UNORM,
             extent: [extent[0], extent[1], 1],
             usage: ImageUsage::TRANSFER_DST | ImageUsage::TRANSFER_SRC | ImageUsage::SAMPLED,
@@ -189,17 +188,17 @@ pub fn load_splash(
         MemoryTypeFilter::PREFER_DEVICE,
     )?;
     let mut cmdbuf = AutoCommandBufferBuilder::primary(
-        cmdbuf_allocator,
+        cmdbuf_allocator.clone(),
         queue.queue_family_index(),
         CommandBufferUsage::OneTimeSubmit,
     )?;
     let buffer = Buffer::new_unsized::<[u8]>(
         allocator,
-        BufferCreateInfo {
+        &BufferCreateInfo {
             usage: BufferUsage::TRANSFER_SRC,
             ..Default::default()
         },
-        AllocationCreateInfo {
+        &AllocationCreateInfo {
             memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE
                 | MemoryTypeFilter::PREFER_DEVICE,
             ..Default::default()
