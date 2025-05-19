@@ -6,7 +6,7 @@
   inputs.rust-manifest = {
     flake = false;
     url =
-      "https://static.rust-lang.org/dist/2025-02-24/channel-rust-nightly.toml";
+      "https://static.rust-lang.org/dist/2025-04-22/channel-rust-nightly.toml";
   };
   description = "xr_passthrough_layer";
 
@@ -29,7 +29,7 @@
     in with pkgs; {
       devShells.${system}.default = mkShell {
         nativeBuildInputs =
-          [ pkg-config cmake rust-toolchain rust-analyzer-nightly cargo-bloat shaderc ];
+          [ pkg-config cmake rust-toolchain rust-analyzer cargo-bloat shaderc ];
         buildInputs = [ systemdLibs linuxHeaders openvr xorg.libxcb ];
         shellHook = ''
           export LD_LIBRARY_PATH="${
