@@ -59,16 +59,15 @@ const PREFERRED_FORMATS: &[format::Format] = &[
 impl App {
     fn setup_window(&mut self, window: Arc<winit::window::Window>) -> Result<()> {
         log::info!("setting up window");
-        let surface =
-            vulkano::swapchain::Surface::from_window(self.instance.clone(), window.clone())?;
+        let surface = vulkano::swapchain::Surface::from_window(&self.instance, &window)?;
         let surface_capabilities = self
             .device
             .physical_device()
-            .surface_capabilities(&surface, SurfaceInfo::default())?;
+            .surface_capabilities(&surface, &SurfaceInfo::default())?;
         let swapchain_formats = self
             .device
             .physical_device()
-            .surface_formats(&surface, SurfaceInfo::default())?
+            .surface_formats(&surface, &SurfaceInfo::default())?
             .into_iter()
             .map(|(f, _)| f)
             .collect::<HashSet<_>>();
@@ -78,9 +77,9 @@ impl App {
             .find(|f| swapchain_formats.contains(f))
             .context("cannot find a suitable format for swapchain images")?;
         let (swapchain, images) = vulkano::swapchain::Swapchain::new(
-            self.device.clone(),
-            surface.clone(),
-            vulkano::swapchain::SwapchainCreateInfo {
+            &self.device,
+            &surface,
+            &vulkano::swapchain::SwapchainCreateInfo {
                 min_image_count: surface_capabilities.min_image_count.max(2),
                 image_format: *swapchain_format,
                 image_extent: window.inner_size().into(),
@@ -103,7 +102,7 @@ impl App {
         let Some(window) = &mut self.window else {
             panic!("recreate non-existent swapchain")
         };
-        (window.swapchain, window.images) = window.swapchain.recreate(SwapchainCreateInfo {
+        (window.swapchain, window.images) = window.swapchain.recreate(&SwapchainCreateInfo {
             image_extent: window.inner.inner_size().into(),
             ..window.swapchain.create_info()
         })?;
@@ -252,15 +251,15 @@ fn main() -> Result<()> {
     )?;
     let instance = xr.vk_instance();
     let (device, queue) = xr.vk_device();
-    let allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
+    let allocator = Arc::new(StandardMemoryAllocator::new(&device, &Default::default())) as _;
     let cmdbuf_allocator = Arc::new(StandardCommandBufferAllocator::new(
-        device.clone(),
-        StandardCommandBufferAllocatorCreateInfo::default(),
-    ));
+        &device,
+        &StandardCommandBufferAllocatorCreateInfo::default(),
+    )) as _;
     let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
-        device.clone(),
-        StandardDescriptorSetAllocatorCreateInfo::default(),
-    ));
+        &device,
+        &StandardDescriptorSetAllocatorCreateInfo::default(),
+    )) as _;
     let camera =
         v4l::Device::with_path(find_index_camera()?).context("cannot open camera device")?;
     if !camera
@@ -275,18 +274,16 @@ fn main() -> Result<()> {
         CAMERA_SIZE,
         v4l::FourCC::new(b"YUYV"),
     ))?;
-    let pipeline_cache = xr_passthrough_layer::config::load_pipeline_cache(
-        device.clone(),
-        &xdg::BaseDirectories::new()?,
-    )?;
+    let pipeline_cache =
+        xr_passthrough_layer::config::load_pipeline_cache(&device, &xdg::BaseDirectories::new()?)?;
     let camera_config = steam::find_steam_config();
     log::info!("{}", format);
     let pp = pipeline::Pipeline::new(
-        device.clone(),
-        allocator.clone(),
-        cmdbuf_allocator.clone(),
-        queue.clone(),
-        descriptor_set_allocator.clone(),
+        &device,
+        &allocator,
+        &cmdbuf_allocator,
+        &queue,
+        &descriptor_set_allocator,
         true,
         camera_config,
         ImageLayout::TransferSrcOptimal,

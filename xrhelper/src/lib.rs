@@ -106,7 +106,7 @@ impl OpenXr {
             let physical_device =
                 xr_instance.vulkan_graphics_device(xr_system, instance.handle().as_raw() as _)?;
             vulkano::device::physical::PhysicalDevice::from_handle(
-                instance.clone(),
+                instance,
                 ash::vk::PhysicalDevice::from_raw(physical_device as _),
             )
         }?;
@@ -155,22 +155,22 @@ impl OpenXr {
         create_info.p_next = &features as *const _ as _;
 
         let vulkano_create_info = vulkano::device::DeviceCreateInfo {
-            queue_create_infos: vec![QueueCreateInfo {
+            queue_create_infos: &[QueueCreateInfo {
                 queue_family_index: queue_family as u32,
-                queues: vec![1.0],
+                queues: &[1.0],
                 ..Default::default()
             }],
-            enabled_extensions: ext,
-            enabled_features: DeviceFeatures {
+            enabled_extensions: &ext,
+            enabled_features: &DeviceFeatures {
                 multiview: true,
                 ..Default::default()
             },
-            physical_devices: [physical_device.clone()].into_iter().collect(),
+            physical_devices: &[&physical_device],
             ..Default::default()
         };
         let (device, mut queues) = unsafe {
             vulkano::device::Device::from_handle(
-                physical_device.clone(),
+                &physical_device,
                 ash::vk::Device::from_raw(
                     xr_instance
                         .create_vulkan_device(
@@ -181,7 +181,7 @@ impl OpenXr {
                         )?
                         .map_err(ash::vk::Result::from_raw)? as _,
                 ),
-                vulkano_create_info,
+                &vulkano_create_info,
             )
         };
         Ok((device, queues.next().unwrap()))
@@ -213,9 +213,9 @@ impl OpenXr {
 
         let vulkano_create_info = vulkano::instance::InstanceCreateInfo {
             max_api_version: Some(vk_version),
-            enabled_extensions: vk_instance_extensions,
-            enabled_layers: vec![
-                "VK_LAYER_KHRONOS_validation".to_owned(),
+            enabled_extensions: &vk_instance_extensions,
+            enabled_layers: &[
+                "VK_LAYER_KHRONOS_validation",
                 //"VK_LAYER_LUNARG_api_dump".to_owned(),
                 //"VK_LAYER_LUNARG_gfxreconstruct".to_owned(),
             ],
@@ -267,9 +267,7 @@ impl OpenXr {
         }
         .map_err(ash::vk::Result::from_raw)?;
         let instance = ash::vk::Instance::from_raw(instance as _);
-        Ok(unsafe {
-            Instance::from_handle(get_vulkan_library().clone(), instance, vulkano_create_info)
-        })
+        Ok(unsafe { Instance::from_handle(get_vulkan_library(), instance, &vulkano_create_info) })
     }
 
     /// render_size: Resolution of the swapchain image for a *single* eye.
@@ -407,9 +405,9 @@ impl OpenXr {
                 let handle = ash::vk::Image::from_raw(handle);
                 let raw_image = unsafe {
                     vulkano::image::sys::RawImage::from_handle_borrowed(
-                        device.clone(),
+                        &device,
                         handle,
-                        ImageCreateInfo {
+                        &ImageCreateInfo {
                             format,
                             array_layers: 2,
                             extent: [width, height, 1],
@@ -457,9 +455,9 @@ impl OpenXr {
                             let handle = ash::vk::Image::from_raw(handle);
                             let raw_image = unsafe {
                                 vulkano::image::sys::RawImage::from_handle_borrowed(
-                                    device.clone(),
+                                    &device,
                                     handle,
-                                    ImageCreateInfo {
+                                    &ImageCreateInfo {
                                         format,
                                         array_layers: 2,
                                         extent: [width, height, 1],

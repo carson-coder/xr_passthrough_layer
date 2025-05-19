@@ -388,16 +388,15 @@ impl App {
             vulkano::format::Format::R8G8B8A8_UNORM,
         ];
         log::info!("setting up window");
-        let surface =
-            vulkano::swapchain::Surface::from_window(self.instance.clone(), window.clone())?;
+        let surface = vulkano::swapchain::Surface::from_window(&self.instance, &window)?;
         let surface_capabilities = self
             .device
             .physical_device()
-            .surface_capabilities(&surface, SurfaceInfo::default())?;
+            .surface_capabilities(&surface, &SurfaceInfo::default())?;
         let swapchain_formats = self
             .device
             .physical_device()
-            .surface_formats(&surface, SurfaceInfo::default())?
+            .surface_formats(&surface, &SurfaceInfo::default())?
             .into_iter()
             .map(|(f, _)| f)
             .collect::<HashSet<_>>();
@@ -407,9 +406,9 @@ impl App {
             .find(|f| swapchain_formats.contains(f))
             .context("cannot find a suitable format for swapchain images")?;
         let (swapchain, images) = vulkano::swapchain::Swapchain::new(
-            self.device.clone(),
-            surface.clone(),
-            vulkano::swapchain::SwapchainCreateInfo {
+            &self.device,
+            &surface,
+            &vulkano::swapchain::SwapchainCreateInfo {
                 min_image_count: surface_capabilities.min_image_count.max(2),
                 image_format: *swapchain_format,
                 image_extent: window.inner_size().into(),
@@ -433,7 +432,7 @@ impl App {
         let Some(window) = &mut self.window else {
             panic!("recreate non-existent swapchain")
         };
-        let (swapchain, images) = window.swapchain.recreate(SwapchainCreateInfo {
+        let (swapchain, images) = window.swapchain.recreate(&SwapchainCreateInfo {
             image_extent: window.inner.inner_size().into(),
             ..window.swapchain.create_info()
         })?;
@@ -527,8 +526,8 @@ impl App {
         )?;
         let extent = swapchain.image_extent();
         let depth_image = Image::new(
-            self.allocator.clone(),
-            ImageCreateInfo {
+            &self.allocator,
+            &ImageCreateInfo {
                 format: vulkano::format::Format::D32_SFLOAT,
                 extent: [extent[0], extent[1], 1],
                 samples: SampleCount::Sample1,
@@ -536,27 +535,25 @@ impl App {
                 usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT,
                 ..Default::default()
             },
-            AllocationCreateInfo {
+            &AllocationCreateInfo {
                 memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
                     | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                 allocate_preference: MemoryAllocatePreference::Unknown,
                 ..Default::default()
             },
         )?;
-        let depth_image = ImageView::new(
-            depth_image.clone(),
-            ImageViewCreateInfo::from_image(&depth_image),
-        )?;
+        let depth_image =
+            ImageView::new(&depth_image, &ImageViewCreateInfo::from_image(&depth_image))?;
         assert!(self.uniform_buffers.len() == self.uniform_buffer_gpu_use_end.len());
         if self.uniform_buffers.len() < images.len() {
             for _ in self.uniform_buffers.len()..images.len() {
                 self.uniform_buffers.push(Buffer::new_sized::<vs::MVP>(
-                    self.allocator.clone(),
-                    BufferCreateInfo {
+                    &self.allocator,
+                    &BufferCreateInfo {
                         usage: BufferUsage::UNIFORM_BUFFER,
                         ..Default::default()
                     },
-                    AllocationCreateInfo {
+                    &AllocationCreateInfo {
                         memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
                             | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                         allocate_preference: MemoryAllocatePreference::Unknown,
@@ -655,7 +652,7 @@ impl App {
                     render_pass.clone(),
                     FramebufferCreateInfo {
                         attachments: vec![
-                            ImageView::new(i.clone(), ImageViewCreateInfo::from_image(i))?,
+                            ImageView::new(i, &ImageViewCreateInfo::from_image(i))?,
                             depth_image.clone(),
                         ],
                         ..Default::default()
@@ -752,20 +749,20 @@ impl App {
                 ..Default::default()
             },
         )?;
-        let allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
+        let allocator = Arc::new(StandardMemoryAllocator::new(&device, &Default::default()));
         let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
-            device.clone(),
-            Default::default(),
+            &device,
+            &Default::default(),
         ));
         let vs = vs::load(device.clone())?;
         let fs = fs::load(device.clone())?;
         let mvp = Buffer::new_sized::<vs::MVP>(
-            allocator.clone(),
-            BufferCreateInfo {
+            &allocator,
+            &BufferCreateInfo {
                 usage: BufferUsage::UNIFORM_BUFFER,
                 ..Default::default()
             },
-            AllocationCreateInfo {
+            &AllocationCreateInfo {
                 memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
                     | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                 allocate_preference: MemoryAllocatePreference::Unknown,
@@ -820,12 +817,12 @@ impl App {
         )?;
         // Vertices for a cube
         let vertices = Buffer::from_iter::<Vertex, _>(
-            allocator.clone(),
-            BufferCreateInfo {
+            &allocator,
+            &BufferCreateInfo {
                 usage: BufferUsage::VERTEX_BUFFER,
                 ..Default::default()
             },
-            AllocationCreateInfo {
+            &AllocationCreateInfo {
                 memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
                     | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                 allocate_preference: MemoryAllocatePreference::Unknown,
@@ -834,12 +831,12 @@ impl App {
             VERTICES.into_iter(),
         )?;
         let indices = Buffer::from_iter::<u32, _>(
-            allocator.clone(),
-            BufferCreateInfo {
+            &allocator,
+            &BufferCreateInfo {
                 usage: BufferUsage::INDEX_BUFFER,
                 ..Default::default()
             },
-            AllocationCreateInfo {
+            &AllocationCreateInfo {
                 memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
                     | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                 allocate_preference: MemoryAllocatePreference::Unknown,
@@ -848,18 +845,18 @@ impl App {
             INDICES.into_iter(),
         )?;
         let cmdbuf_allocator = Arc::new(StandardCommandBufferAllocator::new(
-            device.clone(),
-            Default::default(),
+            &device,
+            &Default::default(),
         ));
         let depth_images: Vec<_> = if let Some(depth_images) = depth_swapchain_images {
             depth_images
                 .iter()
-                .map(|i| ImageView::new(i.clone(), ImageViewCreateInfo::from_image(i)))
+                .map(|i| ImageView::new(i, &ImageViewCreateInfo::from_image(i)))
                 .collect::<Result<_, _>>()?
         } else {
             let depth_image = Image::new(
-                allocator.clone(),
-                ImageCreateInfo {
+                &allocator,
+                &ImageCreateInfo {
                     format: vulkano::format::Format::D32_SFLOAT,
                     extent,
                     samples: representative_image.samples(),
@@ -867,17 +864,15 @@ impl App {
                     usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT,
                     ..Default::default()
                 },
-                AllocationCreateInfo {
+                &AllocationCreateInfo {
                     memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
                         | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                     allocate_preference: MemoryAllocatePreference::Unknown,
                     ..Default::default()
                 },
             )?;
-            let depth_image = ImageView::new(
-                depth_image.clone(),
-                ImageViewCreateInfo::from_image(&depth_image),
-            )?;
+            let depth_image =
+                ImageView::new(&depth_image, &ImageViewCreateInfo::from_image(&depth_image))?;
             swapchain_images
                 .iter()
                 .map(|_| depth_image.clone())
@@ -897,7 +892,7 @@ impl App {
                     render_pass.clone(),
                     FramebufferCreateInfo {
                         attachments: vec![
-                            ImageView::new(i.clone(), ImageViewCreateInfo::from_image(i))?,
+                            ImageView::new(i, &ImageViewCreateInfo::from_image(i))?,
                             di,
                         ],
                         ..Default::default()
