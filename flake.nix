@@ -6,7 +6,7 @@
   inputs.rust-manifest = {
     flake = false;
     url =
-      "https://static.rust-lang.org/dist/2025-04-22/channel-rust-nightly.toml";
+      "https://static.rust-lang.org/dist/2025-11-22/channel-rust-nightly.toml";
   };
   description = "xr_passthrough_layer";
 
@@ -52,7 +52,7 @@
             ]
           }:$LD_LIBRARY_PATH"
         '';
-        LIBCLANG_PATH = lib.makeLibraryPath [ llvmPackages_17.libclang.lib ];
+        LIBCLANG_PATH = lib.makeLibraryPath [ llvmPackages_21.libclang.lib ];
         SHADERC_LIB_DIR = "${lib.getLib shaderc}/lib";
 
         BINDGEN_EXTRA_CLANG_ARGS =

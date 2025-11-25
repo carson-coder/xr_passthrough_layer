@@ -1,1 +1,8 @@
 target
+vgcore.*
+.direnv
+openxrs
+.gdb_history
+.vscode
+gfxrecon_capture_*.gfxr
+flake.lock
