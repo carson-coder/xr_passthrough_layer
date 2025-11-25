@@ -95,7 +95,7 @@ impl From<Arc<PipelineCache>> for AutoSavingPipelineCache {
 impl AutoSavingPipelineCache {
     fn save(&self) -> Result<()> {
         let data = self.0.get_data().context("get pipeline cache data")?;
-        let xdg = xdg::BaseDirectories::new().context("xdg")?;
+        let xdg = xdg::BaseDirectories::new();
 
         let mut f = std::fs::OpenOptions::new()
             .truncate(true)
@@ -106,7 +106,7 @@ impl AutoSavingPipelineCache {
                     .context("create pipeline cache file")?,
             )
             .context("open pipeline cache file")?;
-        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rng());
         let signature = key.sign(&data);
         let verifying_key = key.verifying_key();
         f.write_all(&verifying_key.as_bytes()[..])?;

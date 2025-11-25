@@ -54,7 +54,7 @@ pub struct LighthouseConfig {
 use anyhow::{Context, Result, anyhow};
 /// Try to find the config file for index
 pub fn find_steam_config() -> Option<StereoCamera> {
-    let xdg = xdg::BaseDirectories::new().ok()?;
+    let xdg = xdg::BaseDirectories::new();
     log::debug!("Base directories: {:?}", xdg);
     let steam = xdg
         .find_data_file("steam")
@@ -87,7 +87,7 @@ pub fn find_steam_config() -> Option<StereoCamera> {
     })
 }
 pub fn load_steam_config(hmd_serial: &str) -> Result<StereoCamera> {
-    let xdg = xdg::BaseDirectories::new()?;
+    let xdg = xdg::BaseDirectories::new();
     let steam = xdg
         .find_data_file("steam")
         .or_else(|| xdg.find_data_file("Steam"))

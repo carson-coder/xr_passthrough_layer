@@ -900,10 +900,7 @@ fn create_camera_resources(
     if cfgs.len() != 1 && cfgs.len() != 2 {
         error!("unsupported view count? {}", cfgs.len());
     }
-    let xdg = xdg::BaseDirectories::new().map_err(|e| {
-        warn!("xdg: {e:#}");
-        XrErr::ERROR_RUNTIME_FAILURE
-    })?;
+    let xdg = xdg::BaseDirectories::new();
     let pipeline_cache = crate::config::load_pipeline_cache(device, &xdg).map_err(|e| {
         warn!("Failed to load pipeline cache {e:#}");
         XrErr::ERROR_RUNTIME_FAILURE
