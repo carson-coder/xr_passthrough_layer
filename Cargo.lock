@@ -2131,7 +2131,7 @@ checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 [[package]]
 name = "openxr"
 version = "0.19.0"
-source = "git+https://github.com/yshui-forks/openxrs?branch=dev#a50cd9a13a92b030f4c9ab3171cabdd55adaa4da"
+source = "git+https://github.com/Ralith/openxrs#67a22dc30cd5142a32d8ae3aff8e15cf443e6ddc"
 dependencies = [
  "libc",
  "libloading 0.8.7",
@@ -2142,7 +2142,7 @@ dependencies = [
 [[package]]
 name = "openxr-sys"
 version = "0.11.0"
-source = "git+https://github.com/yshui-forks/openxrs?branch=dev#a50cd9a13a92b030f4c9ab3171cabdd55adaa4da"
+source = "git+https://github.com/Ralith/openxrs#67a22dc30cd5142a32d8ae3aff8e15cf443e6ddc"
 dependencies = [
  "libc",
 ]

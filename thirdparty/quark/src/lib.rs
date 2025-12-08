@@ -639,7 +639,7 @@ macro_rules! api_layer {
             $($fn_name:ident: $override_fn:ident),* $(,)?
         } $(,)?
     ) => {
-        gen_override_table! {
+        $crate::gen_override_table! {
             $crate;
             hooks: {
                 $($handle: $data),*

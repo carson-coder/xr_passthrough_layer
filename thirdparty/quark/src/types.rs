@@ -193,6 +193,16 @@ pub enum AnySession {
     Unhandled(openxr::sys::Session),
 }
 
+impl AnySession {
+    pub fn end(&self) -> openxr::Result<openxr::sys::Result> {
+        match self {
+            Self::Vulkan(s) => s.end(),
+            Self::Gl(s) => s.end(),
+            Self::Unhandled(_) => unimplemented!("unsupported session type"),
+        }
+    }
+}
+
 impl openxr::AsHandle for AnySession {
     type Handle = openxr::sys::Session;
     fn as_handle(&self) -> Self::Handle {

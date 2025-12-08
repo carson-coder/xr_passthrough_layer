@@ -250,7 +250,7 @@ impl Pipeline {
         queue: &Arc<Queue>,
         descriptor_set_allocator: &Arc<dyn DescriptorSetAllocator>,
         source_is_yuyv: bool,
-        camera_config: Option<StereoCamera>,
+        camera_config: Option<&StereoCamera>,
         final_layout: ImageLayout,
         output_usage: ImageUsage,
         pipeline_cache: Arc<PipelineCache>,
@@ -521,7 +521,7 @@ impl Pipeline {
         Ok(Self {
             correction,
             capture: false,
-            camera_config,
+            camera_config: camera_config.copied(),
             input_image_buffer: cpu_buffer,
             input_image_gpu: input_texture,
             postprocessed_image,
