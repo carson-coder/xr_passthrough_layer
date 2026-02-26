@@ -5,32 +5,49 @@
   };
   inputs.rust-manifest = {
     flake = false;
-    url =
-      "https://static.rust-lang.org/dist/2025-11-22/channel-rust-nightly.toml";
+    url = "https://static.rust-lang.org/dist/2025-11-22/channel-rust-nightly.toml";
   };
   description = "xr_passthrough_layer";
 
-  outputs = { self, nixpkgs, fenix, ... }@inputs:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      fenix,
+      ...
+    }@inputs:
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs {
         inherit system;
         overlays = [ fenix.overlays.default ];
       };
-      rust-toolchain =
-        (pkgs.fenix.fromManifestFile inputs.rust-manifest).withComponents [
-          "rustfmt"
-          "rust-src"
-          "clippy"
-          "rustc"
-          "cargo"
-          "miri-preview"
-        ];
-    in with pkgs; {
+      rust-toolchain = (pkgs.fenix.fromManifestFile inputs.rust-manifest).withComponents [
+        "rustfmt"
+        "rust-src"
+        "clippy"
+        "rustc"
+        "cargo"
+        "miri-preview"
+      ];
+    in
+    with pkgs;
+    {
       devShells.${system}.default = mkShell {
-        nativeBuildInputs =
-          [ pkg-config cmake rust-toolchain rust-analyzer cargo-bloat shaderc ];
-        buildInputs = [ systemdLibs linuxHeaders openvr xorg.libxcb ];
+        nativeBuildInputs = [
+          pkg-config
+          cmake
+          rust-toolchain
+          rust-analyzer
+          cargo-bloat
+          shaderc
+        ];
+        buildInputs = [
+          systemdLibs
+          linuxHeaders
+          openvr
+          xorg.libxcb
+        ];
         shellHook = ''
           export LD_LIBRARY_PATH="${
             lib.makeLibraryPath [
@@ -60,19 +77,11 @@
           (builtins.map (a: ''-I"${a}/include"'') [
             # add dev libraries here (e.g. pkgs.libvmi.dev)
             linuxHeaders
-          ]) ++ [
-            ''
-              -isystem "${pkgs.llvmPackages_latest.libclang.lib}/lib/clang/${
-                lib.versions.major pkgs.llvmPackages_latest.libclang.version
-              }/include"''
-            ''
-              -isystem "${stdenv.cc.cc}/include/c++/${
-                lib.getVersion stdenv.cc.cc
-              }"''
-            ''
-              -isystem "${stdenv.cc.cc}/include/c++/${
-                lib.getVersion stdenv.cc.cc
-              }/${stdenv.hostPlatform.config}"''
+          ])
+          ++ [
+            ''-isystem "${pkgs.llvmPackages_latest.libclang.lib}/lib/clang/${lib.versions.major pkgs.llvmPackages_latest.libclang.version}/include"''
+            ''-isystem "${stdenv.cc.cc}/include/c++/${lib.getVersion stdenv.cc.cc}"''
+            ''-isystem "${stdenv.cc.cc}/include/c++/${lib.getVersion stdenv.cc.cc}/${stdenv.hostPlatform.config}"''
             ''-isystem "${glibc.dev}/include"''
           ];
       };
