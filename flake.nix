@@ -1,11 +1,10 @@
 {
-  inputs.fenix = {
-    inputs.nixpkgs.follows = "nixpkgs";
-    url = "github:nix-community/fenix";
-  };
-  inputs.rust-manifest = {
-    flake = false;
-    url = "https://static.rust-lang.org/dist/2025-11-22/channel-rust-nightly.toml";
+  inputs = {
+    rustup.url = "github:yshui/rustup.nix";
+    rust-manifest = {
+      flake = false;
+      url = "https://static.rust-lang.org/dist/2026-02-26/channel-rust-nightly.toml";
+    };
   };
   description = "xr_passthrough_layer";
 
@@ -13,23 +12,25 @@
     {
       self,
       nixpkgs,
-      fenix,
-      ...
-    }@inputs:
+      rustup,
+      rust-manifest,
+    }:
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs {
         inherit system;
-        overlays = [ fenix.overlays.default ];
+        overlays = [ rustup.overlays.default ];
       };
-      rust-toolchain = (pkgs.fenix.fromManifestFile inputs.rust-manifest).withComponents [
-        "rustfmt"
-        "rust-src"
-        "clippy"
-        "rustc"
-        "cargo"
-        "miri-preview"
-      ];
+      rust-toolchain = (pkgs.rustToolchainFromManifestFile rust-manifest).minimal.override {
+        extensions = [
+          "rustfmt"
+          "rust-src"
+          "clippy"
+          "rustc"
+          "cargo"
+          "miri-preview"
+        ];
+      };
     in
     with pkgs;
     {
