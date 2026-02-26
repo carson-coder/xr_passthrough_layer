@@ -275,7 +275,7 @@ impl Pipeline {
             Format::R8G8B8A8_UNORM
         };
         let (vs, fs) = Self::load_shader(
-            &device,
+            device,
             source_is_yuyv,
             camera_config.is_some(),
             has_yuyv_sampler,
@@ -338,7 +338,7 @@ impl Pipeline {
         })
         .unwrap();
         let correction = camera_config
-            .map(|c| StereoUndistortParams::new(camera_size, &c))
+            .map(|c| StereoUndistortParams::new(camera_size, c))
             .transpose()?;
         log::debug!("correction fov: {:?}", correction.as_ref().map(|x| x.fov()));
         let fov = correction

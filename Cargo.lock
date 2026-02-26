@@ -947,7 +947,7 @@ dependencies = [
  "ash",
  "ctrlc",
  "env_logger",
- "glam 0.30.3",
+ "glam 0.32.0",
  "log",
  "openxr",
  "smallvec 1.15.0",
@@ -1203,6 +1203,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b46b9ca4690308844c644e7c634d68792467260e051c8543e0c7871662b3ba7"
 
 [[package]]
+name = "glam"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34627c5158214743a374170fed714833fdf4e4b0cbcc1ea98417866a4c5d4441"
+
+[[package]]
 name = "glob"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1269,7 +1275,7 @@ dependencies = [
  "bytemuck",
  "ctrlc",
  "env_logger",
- "glam 0.30.3",
+ "glam 0.32.0",
  "log",
  "openxr",
  "renderdoc",
@@ -4241,7 +4247,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ash",
- "glam 0.30.3",
+ "glam 0.32.0",
  "itertools 0.14.0",
  "log",
  "nalgebra",
@@ -4262,7 +4268,7 @@ dependencies = [
  "config",
  "ed25519-dalek",
  "env_logger",
- "glam 0.30.3",
+ "glam 0.32.0",
  "humantime-serde",
  "image",
  "itertools 0.14.0",

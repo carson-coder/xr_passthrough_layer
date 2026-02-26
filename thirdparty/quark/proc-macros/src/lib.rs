@@ -9,10 +9,7 @@ use proc_macro2::{token_stream, Delimiter, Group, Ident, Punct, TokenStream, Tok
 
 fn parse_ident_map(tokens: TokenStream, map: &mut HashMap<String, String>) {
     let mut tokens = tokens.into_iter();
-    loop {
-        let Ok(k) = tokens.expect_ident() else {
-            break;
-        };
+    while let Ok(k) = tokens.expect_ident() {
         tokens.expect_punct(':').unwrap();
         let v = tokens.expect_ident().unwrap();
         let old = map.insert(k.to_string(), v.to_string());
@@ -761,10 +758,7 @@ pub fn gen_override_table(tokens: proc_macro::TokenStream) -> proc_macro::TokenS
         .map(|c| &c.name)
         .collect::<HashSet<_>>();
     tokens.expect_punct(';').unwrap();
-    loop {
-        let Ok(ident) = tokens.expect_ident() else {
-            break;
-        };
+    while let Ok(ident) = tokens.expect_ident() {
         tokens.expect_punct(':').unwrap();
         let group = tokens.expect_group(Delimiter::Brace).unwrap();
 

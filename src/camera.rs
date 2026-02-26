@@ -33,7 +33,7 @@ impl CameraThread {
             .unwrap()
             .into_rgba8();
         let extent = [img.width(), img.height()];
-        assert!(extent[0] % 2 == 0);
+		assert!(extent[0].is_multiple_of(2));
 
         let frame = FrameInfo {
             frame: img.into_raw(),

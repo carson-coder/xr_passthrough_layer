@@ -22,7 +22,7 @@ env_logger = "0.11.3"
 itertools = "0.14.0"
 v4l = "0.14.0"
 ash = "0.38.0"
-glam = "0.30.0"
+glam = "0.32.0"
 smallvec = "1.14.0"
 smallvec2 = { version = "=2.0.0-alpha.12", package = "smallvec" }
 xdg = "3.0.0"
