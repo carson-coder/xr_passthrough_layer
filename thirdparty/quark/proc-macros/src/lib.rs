@@ -14,7 +14,7 @@ fn parse_ident_map(tokens: TokenStream, map: &mut HashMap<String, String>) {
         let v = tokens.expect_ident().unwrap();
         let old = map.insert(k.to_string(), v.to_string());
         if let Some(old) = old {
-            panic!("Duplicate entry for key {old}");
+            panic!("Duplicate entry for key '{k}', previous value was '{old}'");
         }
         let Ok(_) = tokens.expect_punct(',') else {
             break;
@@ -36,7 +36,7 @@ trait TokenStreamExt: Iterator<Item = TokenTree> {
         let next = self.next().ok_or("Unexpected end of tokens")?;
         match next {
             TokenTree::Punct(next) if next.as_char() == p => Ok(next),
-            other => panic!("Unexpected token {other}, expecting {p}"),
+            other => panic!("Unexpected token `{other}`, expected punctuation `{p}`"),
         }
     }
     fn expect_group(&mut self, delimiter: Delimiter) -> Result<Group, &'static str> {
@@ -44,10 +44,14 @@ trait TokenStreamExt: Iterator<Item = TokenTree> {
         match next {
             TokenTree::Group(next) if next.delimiter() == delimiter => Ok(next),
             TokenTree::Group(next) => {
-                panic!("Unexpected token {}", delimiter_start(next.delimiter()))
+                panic!(
+                    "Unexpected group delimiter `{}`, expected `{}`",
+                    delimiter_start(next.delimiter()),
+                    delimiter_start(delimiter)
+                )
             }
             other => panic!(
-                "Unexpected token {other}, expecting {}",
+                "Unexpected token `{other}`, expected group with delimiter `{}`",
                 delimiter_start(delimiter)
             ),
         }
@@ -56,7 +60,7 @@ trait TokenStreamExt: Iterator<Item = TokenTree> {
         let next = self.next().ok_or("Unexpected end of tokens")?;
         match next {
             TokenTree::Ident(next) => Ok(next),
-            other => panic!("Unexpected token {other}, expecting ident"),
+            other => panic!("Unexpected token `{other}`, expected identifier"),
         }
     }
 }
@@ -218,7 +222,10 @@ impl std::fmt::Display for Type {
         match self {
             Self::Const(inner) => match &**inner {
                 Self::Ptr(base) => write!(f, "*const {base}"),
-                _ => panic!("const not attached to pointer"),
+                _ => panic!(
+                    "const modifier not attached to a pointer type, found {:?}",
+                    inner
+                ),
             },
             Self::Ptr(inner) => write!(f, "*mut {inner}"),
             Self::Base(base) => write!(f, "{base}"),
@@ -234,24 +241,33 @@ impl From<&'_ [spec::SignatureParts]> for Type {
             }
             spec::SignatureParts::Type(t) => {
                 if let spec::SignatureParts::Other(p) = &value[1] {
-                    assert_eq!(p, "*", "Malformed openxr spec");
+                    assert_eq!(
+                        p, "*",
+                        "Malformed openxr spec: expected '*' after type name, found '{p}'"
+                    );
                     Self::Ptr(Box::new(Self::Base(t.clone())))
                 } else if value.len() > 2 {
                     if let spec::SignatureParts::Other(p) = &value[2] {
                         assert_eq!(
                             p, "[",
-                            "Malformed openxr spec, unexpected \"{p}\" after name"
+                             "Malformed openxr spec: expected '[' after type name for array, found '{p}'"
                         );
                         // Array type, treat as pointer
                         Self::Ptr(Box::new(Self::Base(t.clone())))
                     } else {
-                        panic!("Unexpected {:?} after name", value[2]);
+                        panic!(
+                            "Malformed openxr spec: unexpected token {:?} after type name",
+                            value[2]
+                        );
                     }
                 } else {
                     Self::Base(t.clone())
                 }
             }
-            _ => panic!("Malformed openxr spec"),
+            _ => panic!(
+                "Malformed openxr spec: unexpected signature part {:?}",
+                value[0]
+            ),
         }
     }
 }
@@ -280,7 +296,12 @@ impl From<&'_ [spec::SignatureParts]> for Signature {
                     None
                 }
             })
-            .expect("Malformed openxr spec, can't find name in signature");
+            .unwrap_or_else(|| {
+                panic!(
+                    "Malformed openxr spec: could not find name in signature parts: {:?}",
+                    value
+                )
+            });
         Self {
             ty,
             name: name.to_string(),
@@ -665,11 +686,11 @@ pub fn impl_create(tokens: proc_macro::TokenStream) -> proc_macro::TokenStream {
 #[proc_macro]
 pub fn gen_facades(tokens: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let mut tokens = TokenStream::from(tokens).into_iter();
-    let crate_ = tokens.next().expect("missing $crate");
+    let crate_ = tokens.next().unwrap_or_else(|| panic!("gen_facades: missing $crate argument, expected something like `gen_facades!(my_crate; ...)`"));
     let manual_impl = tokens
         .map(|t| {
             let TokenTree::Ident(ident) = t else {
-                panic!("Unexpected token {t}")
+                panic!("gen_facades: expected identifier for manual impl, found `{t}`");
             };
             ident.to_string()
         })
@@ -715,10 +736,11 @@ fn find_closure(hooks: &mut HashMap<String, String>) -> Vec<String> {
             continue;
         }
         let name = format!("Xr{k}");
-        let parent = PARSED_SPEC
-            .parent_of
-            .get(&name)
-            .unwrap_or_else(|| panic!("Can't find parent of {name}"));
+        let parent = PARSED_SPEC.parent_of.get(&name).unwrap_or_else(|| {
+            panic!(
+                "gen_override_table: could not find parent type for handle `{name}` in OpenXR spec"
+            )
+        });
         let parent = parent.strip_prefix("Xr").unwrap();
         if !hooks.contains_key(parent) {
             ret.push(parent.to_string());
@@ -765,7 +787,7 @@ pub fn gen_override_table(tokens: proc_macro::TokenStream) -> proc_macro::TokenS
         match ident.to_string().as_str() {
             "hooks" => parse_ident_map(group.stream(), &mut hooks),
             "override_fns" => parse_ident_map(group.stream(), &mut override_fns),
-            other => panic!("Unexpected field {other}"),
+        other => panic!("gen_override_table: unexpected field `{other}`, expected `hooks` or `override_fns`"),
         }
         let Ok(_) = tokens.expect_punct(',') else {
             break;
