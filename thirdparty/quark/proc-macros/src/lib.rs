@@ -236,20 +236,21 @@ impl std::fmt::Display for Type {
 impl From<&'_ [spec::SignatureParts]> for Type {
     fn from(value: &[spec::SignatureParts]) -> Self {
         match &value[0] {
-            spec::SignatureParts::Other(q) if q == "const" => {
+            spec::SignatureParts::Other(q) if q.trim() == "const" => {
                 Self::Const(Box::new(value[1..].into()))
             }
             spec::SignatureParts::Type(t) => {
                 if let spec::SignatureParts::Other(p) = &value[1] {
                     assert_eq!(
-                        p, "*",
+                        p.trim(),
+                        "*",
                         "Malformed openxr spec: expected '*' after type name, found '{p}'"
                     );
                     Self::Ptr(Box::new(Self::Base(t.clone())))
                 } else if value.len() > 2 {
                     if let spec::SignatureParts::Other(p) = &value[2] {
                         assert_eq!(
-                            p, "[",
+                            p.trim(), "[",
                              "Malformed openxr spec: expected '[' after type name for array, found '{p}'"
                         );
                         // Array type, treat as pointer
