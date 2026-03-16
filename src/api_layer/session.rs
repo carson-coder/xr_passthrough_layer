@@ -9,22 +9,20 @@ use quark::{Hooked as _, Low as _, prelude::XrResult, try_xr, types::AnySession}
 use smallvec::smallvec;
 use std::{collections::HashSet, sync::Arc};
 use vulkano::{
-    Handle as _,
+    Handle as _, VulkanObject,
     command_buffer::{
         AutoCommandBufferBuilder, BlitImageInfo, CommandBufferUsage, ImageBlit,
         allocator::{CommandBufferAllocator, StandardCommandBufferAllocator},
     },
-    descriptor_set::allocator::{DescriptorSetAllocator, StandardDescriptorSetAllocator},
-    device::QueueCreateInfo,
+    descriptor_set::allocator::StandardDescriptorSetAllocator,
+    device::{DefaultQueueMutex, DeviceExtensions, DeviceQueueInfo, QueueCreateInfo},
     image::{ImageCreateInfo, ImageLayout, ImageUsage},
+    instance::InstanceExtensions,
     memory::allocator::{MemoryAllocator, StandardMemoryAllocator},
     sync::GpuFuture as _,
 };
 
-use crate::api_layer::{
-    CameraResources, PassthroughInner, REQUIRED_VK_DEVICE_EXTENSIONS,
-    REQUIRED_VK_INSTANCE_EXTENSIONS, XrErr, xrcvt,
-};
+use crate::api_layer::{CameraResources, PassthroughInner, XrErr, xrcvt};
 
 #[allow(clippy::large_enum_variant)]
 enum SessionState {
@@ -48,7 +46,7 @@ struct SessionDataInner {
     system_id: openxr::SystemId,
     allocator: Arc<dyn MemoryAllocator>,
     cmdbuf_allocator: Arc<dyn CommandBufferAllocator>,
-    descriptor_set_allocator: Arc<dyn DescriptorSetAllocator>,
+    descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     space: openxr::Space,
 }
 impl SessionDataInner {
@@ -571,10 +569,13 @@ impl quark::Hook for SessionData {
             (req.min_api_version_supported.into_raw() as u32).into()
         };
         log::info!("Vulkan API version: {api_version}");
-        let enabled_vk_instance_extensions = REQUIRED_VK_INSTANCE_EXTENSIONS
-            .iter()
-            .map(|&e| e.to_str().unwrap())
-            .collect();
+        let enabled_vk_instance_extensions = InstanceExtensions {
+            khr_external_memory_capabilities: true,
+            khr_get_physical_device_properties2: true,
+            khr_xcb_surface: true,
+            ..Default::default()
+        };
+
         let vk_create_info = vulkano::instance::InstanceCreateInfo {
             enabled_extensions: &enabled_vk_instance_extensions,
             max_api_version: Some(api_version),
@@ -600,10 +601,10 @@ impl quark::Hook for SessionData {
             }
         };
         let queues = vec![0.0; gb.queue_index as usize + 1];
-        let enabled_vk_device_extensions = REQUIRED_VK_DEVICE_EXTENSIONS
-            .iter()
-            .map(|&e| e.to_str().unwrap())
-            .collect();
+        let enabled_vk_device_extensions = DeviceExtensions {
+            khr_copy_commands2: true,
+            ..Default::default()
+        };
         let vk_create_info = vulkano::device::DeviceCreateInfo {
             queue_create_infos: &[QueueCreateInfo {
                 queue_family_index: gb.queue_family_index,
@@ -613,16 +614,31 @@ impl quark::Hook for SessionData {
             enabled_extensions: &enabled_vk_device_extensions,
             ..Default::default()
         };
-        let (device, mut queue) = unsafe {
+        let device = unsafe {
             vulkano::device::Device::from_handle_borrowed(
                 &physical_device,
                 ash::vk::Handle::from_raw(gb.device as usize as u64),
                 &vk_create_info,
             )
         };
-        let Some(queue) = queue.nth(gb.queue_index as _) else {
-            warn!("Failed to get requested Vulkan queue");
-            return Ok(Self::default());
+        let queue = unsafe {
+            let mut queue = ash::vk::Queue::null();
+            (device.fns().v1_0.get_device_queue)(
+                device.handle(),
+                gb.queue_family_index,
+                gb.queue_index,
+                &mut queue,
+            );
+            vulkano::device::Queue::from_handle(
+                &device,
+                queue,
+                &DeviceQueueInfo {
+                    queue_family_index: gb.queue_family_index,
+                    queue_index: gb.queue_index,
+                    ..Default::default()
+                },
+                Arc::new(DefaultQueueMutex::new()),
+            )
         };
 
         let allocator = Arc::new(StandardMemoryAllocator::new(&device, &Default::default()));

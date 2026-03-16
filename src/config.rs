@@ -148,15 +148,15 @@ pub fn load_pipeline_cache(
         })
     {
         PipelineCache::new(
-            device.clone(),
-            PipelineCacheCreateInfo {
+            &device,
+            &PipelineCacheCreateInfo {
                 // SAFETY: we validated the signature
-                initial_data: Some(unsafe { PipelineCacheData::new(data) }),
+                initial_data: Some(unsafe { PipelineCacheData::new(&data) }),
                 ..Default::default()
             },
         )
     } else {
-        PipelineCache::new(device.clone(), PipelineCacheCreateInfo::default())
+        PipelineCache::new(&device, &PipelineCacheCreateInfo::default())
     }
     .map_err(Into::into)
 }

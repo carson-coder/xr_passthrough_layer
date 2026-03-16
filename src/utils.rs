@@ -92,7 +92,7 @@ fn allocate_dedicated(
         device_memory
             .map(&MemoryMapInfo {
                 offset: 0,
-                size: device_memory.allocation_size(),
+                size: Some(device_memory.allocation_size()),
                 ..Default::default()
             })
             .map_err(MemoryAllocatorError::AllocateDeviceMemory)?;

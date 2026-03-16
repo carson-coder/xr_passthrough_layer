@@ -17,7 +17,10 @@ use vulkano::{
         RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo,
         allocator::CommandBufferAllocator,
     },
-    descriptor_set::{DescriptorSet, WriteDescriptorSet, allocator::DescriptorSetAllocator},
+    descriptor_set::{
+        DescriptorBufferInfo, DescriptorImageInfo, DescriptorSet, WriteDescriptorSet,
+        allocator::DescriptorSetAllocator,
+    },
     device::{Device, Queue},
     format::{Format, FormatFeatures},
     image::{
@@ -43,11 +46,10 @@ use vulkano::{
             GraphicsPipelineCreateInfo,
             color_blend::ColorBlendState,
             input_assembly::{InputAssemblyState, PrimitiveTopology},
-            rasterization::RasterizationState,
+            subpass::PipelineSubpassType,
             vertex_input::{self, Vertex as _, VertexDefinition},
             viewport::{Viewport, ViewportState},
         },
-        layout::PipelineDescriptorSetLayoutCreateInfo,
     },
     render_pass::{Framebuffer, Subpass},
     shader::ShaderModule,
@@ -230,12 +232,12 @@ impl Pipeline {
         has_camera_config: bool,
         has_yuyv_sampler: bool,
     ) -> anyhow::Result<(Arc<ShaderModule>, Arc<ShaderModule>)> {
-        let vs = vs::load(device.clone())?;
+        let vs = vs::load(device)?;
         let fs = match (source_is_yuyv && !has_yuyv_sampler, has_camera_config) {
-            (true, true) => fs::yuyv_undistort::load(device.clone())?,
-            (true, false) => fs::yuyv::load(device.clone())?,
-            (false, true) => fs::undistort::load(device.clone())?,
-            (false, false) => fs::unprocessed::load(device.clone())?,
+            (true, true) => fs::yuyv_undistort::load(device)?,
+            (true, false) => fs::yuyv::load(device)?,
+            (false, true) => fs::undistort::load(device)?,
+            (false, false) => fs::unprocessed::load(device)?,
         };
         Ok((vs, fs))
     }
@@ -248,7 +250,7 @@ impl Pipeline {
         allocator: &Arc<dyn MemoryAllocator>,
         cmdbuf_allocator: &Arc<dyn CommandBufferAllocator>,
         queue: &Arc<Queue>,
-        descriptor_set_allocator: &Arc<dyn DescriptorSetAllocator>,
+        descriptor_set_allocator: &Arc<impl DescriptorSetAllocator>,
         source_is_yuyv: bool,
         camera_config: Option<&StereoCamera>,
         final_layout: ImageLayout,
@@ -322,7 +324,7 @@ impl Pipeline {
             },
             MemoryTypeFilter::HOST_SEQUENTIAL_WRITE | MemoryTypeFilter::PREFER_DEVICE,
         )?;
-        let render_pass = vulkano::single_pass_renderpass!(device.clone(),
+        let render_pass = vulkano::single_pass_renderpass!(&device,
         attachments: {
             color: {
                 format: vulkano::format::Format::R8G8B8A8_UNORM,
@@ -345,15 +347,11 @@ impl Pipeline {
             .as_ref()
             .map(|c| c.fov())
             .unwrap_or([Vec2::new(1.19, 1.19); 2]); // default to roughly 100 degrees fov, hopefully this is sensible
-        let stages = smallvec![
-            PipelineShaderStageCreateInfo::new(vs_main.clone()),
-            PipelineShaderStageCreateInfo::new(fs_main),
+        let stages = [
+            PipelineShaderStageCreateInfo::new(&vs_main),
+            PipelineShaderStageCreateInfo::new(&fs_main),
         ];
-        let layout = PipelineLayout::new(
-            device.clone(),
-            PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
-                .into_pipeline_layout_create_info(device.clone())?,
-        )?;
+        let layout = PipelineLayout::from_stages(&device, &stages)?;
         let sampler = Sampler::new(
             device,
             &SamplerCreateInfo {
@@ -401,47 +399,63 @@ impl Pipeline {
             })
             .transpose()?;
         let pipeline = GraphicsPipeline::new(
-            device.clone(),
-            Some(pipeline_cache),
-            GraphicsPipelineCreateInfo {
-                vertex_input_state: Some(Vertex::per_vertex().definition(&vs_main)?),
-                stages,
-                input_assembly_state: Some(InputAssemblyState {
+            &device,
+            Some(&pipeline_cache),
+            &GraphicsPipelineCreateInfo {
+                vertex_input_state: Some(&Vertex::per_vertex().definition(&vs_main)?),
+                stages: &stages,
+                input_assembly_state: Some(&InputAssemblyState {
                     topology: PrimitiveTopology::TriangleFan,
                     ..Default::default()
                 }),
-                viewport_state: Some(ViewportState {
-                    viewports: smallvec![Viewport {
+                viewport_state: Some(&ViewportState {
+                    viewports: &[Viewport {
                         offset: [0., 0.],
                         extent: [(render_size.x * 2) as _, render_size.y as _],
                         ..Default::default()
                     }],
                     ..Default::default()
                 }),
-                subpass: Some(Subpass::from(render_pass.clone(), 0).unwrap().into()),
-                multisample_state: Some(Default::default()),
-                color_blend_state: Some(ColorBlendState::with_attachment_states(
-                    1,
-                    Default::default(),
+                subpass: Some(PipelineSubpassType::BeginRenderPass(
+                    &Subpass::new(&render_pass, 0).unwrap(),
                 )),
-                rasterization_state: Some(RasterizationState::default()),
-                ..GraphicsPipelineCreateInfo::new(layout)
+                multisample_state: Some(&Default::default()),
+                color_blend_state: Some(&ColorBlendState {
+                    attachments: &[Default::default()],
+                    ..Default::default()
+                }),
+                rasterization_state: Some(&Default::default()),
+                ..GraphicsPipelineCreateInfo::new(&layout)
             },
         )?;
-        let desc_set_writes = [WriteDescriptorSet::image_view_sampler(
-            1,
-            ImageView::new(
+        let desc_set = {
+            let input_texture_view = ImageView::new(
                 &input_texture,
                 &ImageViewCreateInfo::from_image(&input_texture),
-            )?,
-            sampler.clone(),
-        )]
-        .into_iter()
-        .chain(
-            distortion_params
-                .clone()
-                .map(|b| WriteDescriptorSet::buffer(2, b)),
-        );
+            )?;
+            let input_texture_descriptor_info = DescriptorImageInfo {
+                sampler: Some(&sampler),
+                image_view: Some(&input_texture_view),
+                image_layout: ImageLayout::ShaderReadOnlyOptimal,
+            };
+            let mut desc_set_writes =
+                vec![WriteDescriptorSet::image(1, &input_texture_descriptor_info)];
+            let distortion_params_buffer_info =
+                distortion_params.as_ref().map(|b| DescriptorBufferInfo {
+                    buffer: Some(b.buffer()),
+                    ..Default::default()
+                });
+            let distortion_params_buffer_descriptor = distortion_params_buffer_info
+                .as_ref()
+                .map(|i| WriteDescriptorSet::buffer(2, i));
+            desc_set_writes.extend(distortion_params_buffer_descriptor);
+            DescriptorSet::new(
+                descriptor_set_allocator,
+                pipeline.layout().set_layouts().first().unwrap(),
+                &desc_set_writes,
+                &[],
+            )?
+        };
         let vertices = Buffer::from_iter::<Vertex, _>(
             allocator,
             &BufferCreateInfo {
@@ -473,18 +487,12 @@ impl Pipeline {
             .cloned(),
         )
         .unwrap();
-        let desc_set = DescriptorSet::new(
-            descriptor_set_allocator.clone(),
-            pipeline.layout().set_layouts().first().unwrap().clone(),
-            desc_set_writes,
-            None,
-        )?;
         let buffer = Subbuffer::new(cpu_buffer.clone());
         let ivci = ImageViewCreateInfo::from_image(&postprocessed_image);
         let framebuffer = Framebuffer::new(
-            render_pass.clone(),
-            vulkano::render_pass::FramebufferCreateInfo {
-                attachments: vec![ImageView::new(&postprocessed_image, &ivci)?],
+            &render_pass,
+            &vulkano::render_pass::FramebufferCreateInfo {
+                attachments: &[&ImageView::new(&postprocessed_image, &ivci)?],
                 ..Default::default()
             },
         )?;

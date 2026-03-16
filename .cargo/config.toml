@@ -3,6 +3,7 @@ rustflags = [ "-Cforce-frame-pointers=yes" ]
 
 [patch.crates-io]
 vulkano = { git = "https://github.com/vulkano-rs/vulkano" }
+vulkano-shaders = { git = "https://github.com/vulkano-rs/vulkano" }
 
 [alias]
 xtask = "run --package xtask --"

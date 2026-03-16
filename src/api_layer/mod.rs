@@ -126,7 +126,7 @@ impl quark::Hook for PassthroughData {
 }
 
 static VULKAN_LIBRARY: LazyLock<Arc<vulkano::library::VulkanLibrary>> =
-    LazyLock::new(|| vulkano::library::VulkanLibrary::new().unwrap());
+    LazyLock::new(|| unsafe { vulkano::library::VulkanLibrary::new().unwrap() });
 
 static LOG_INIT: OnceLock<()> = OnceLock::new();
 

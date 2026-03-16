@@ -11,28 +11,28 @@ license = "MIT"
 members = [ "thirdparty/quark", "thirdparty/quark/proc-macros", "hello", "experiment" , "xrhelper", "xtask"]
 
 [workspace.dependencies]
-vulkano = "0.35.0"
-vulkano-shaders = "0.35.0"
-anyhow = { version = "1.0.45", features = ["backtrace"] }
-openxr = { version = "0.19.0", git = "https://github.com/Ralith/openxrs" }
-nalgebra = "0.34.1"
-serde = { version = "1.0.130", features = ["derive"] }
-log = "0.4.14"
-env_logger = "0.11.3"
-itertools = "0.14.0"
-v4l = "0.14.0"
-ash = "0.38.0"
-glam = "0.32.0"
-smallvec = "1.14.0"
+vulkano = "0.35"
+vulkano-shaders = "0.35"
+anyhow = { version = "1.0", features = ["backtrace"] }
+openxr = "0.21"
+nalgebra = "0.34"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+itertools = "0.14"
+v4l = "0.14"
+ash = "0.38"
+glam = "0.32"
+smallvec = "1.15"
 smallvec2 = { version = "=2.0.0-alpha.12", package = "smallvec" }
 xdg = "3.0.0"
 xr = { path = "./xrhelper" }
-shaderc = "0.8.3"
-bytemuck = { version = "^1.7", features = ["derive"] }
-renderdoc = "0.12.1"
-ctrlc = "3.4.5"
-winit = "0.30.9"
-phf = { version = "0.13.1", features = ["macros"] }
+shaderc = "0.10"
+bytemuck = { version = "1.25", features = ["derive"] }
+renderdoc = "0.12"
+ctrlc = "3.5"
+winit = "0.30"
+phf = { version = "0.13", features = ["macros"] }
 
 [lib]
 crate-type = ["cdylib", "lib"]
@@ -63,7 +63,7 @@ thiserror = "2.0.11"
 config = "0.15.8"
 argh = "0.1.6"
 serde_json = "1.0.70"
-toml = "0.9.8"
+toml = "1"
 humantime-serde = "1.0.1"
 libloading = "0.9.0"
 quark = { path = "thirdparty/quark" }
