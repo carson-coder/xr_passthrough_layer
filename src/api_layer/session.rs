@@ -1,5 +1,5 @@
 use glam::UVec2;
-use log::{debug, error, warn};
+use log::{debug, error, trace, warn};
 use openxr::{
     AsHandle, CompositionLayerFlags, EnvironmentBlendMode, Extent2Di, Offset2Di, Rect2Di,
     ReferenceSpaceType, SwapchainCreateFlags, SwapchainCreateInfo, SwapchainSubImage,
@@ -40,14 +40,6 @@ enum SessionState {
         size: UVec2,
         image_index: Option<u32>,
     },
-}
-impl SessionState {
-    fn view_type(&self) -> Option<openxr::sys::ViewConfigurationType> {
-        match self {
-            &Self::Running { view_type, .. } => Some(view_type),
-            _ => None,
-        }
-    }
 }
 struct SessionDataInner {
     device: Arc<vulkano::device::Device>,
@@ -147,12 +139,8 @@ impl SessionDataInner {
             SessionState::Running { .. } => Err(XrErr::ERROR_SESSION_RUNNING),
             SessionState::Idle { passthrough } => {
                 let instance = session.instance();
-                let cfgs = instance.enumerate_view_configuration_views(
-                    self.system_id,
-                    self.state
-                        .view_type()
-                        .ok_or(XrErr::ERROR_SESSION_NOT_RUNNING)?,
-                )?;
+                let cfgs =
+                    instance.enumerate_view_configuration_views(self.system_id, view_type)?;
                 if cfgs.len() != 1 && cfgs.len() != 2 {
                     error!("unsupported view count? {}", cfgs.len());
                 }
@@ -305,6 +293,13 @@ impl SessionData {
         instance: &openxr::Instance,
         info: &FrameEndInfo<'_>,
     ) -> Result<(), XrErr> {
+        for (i, l) in info.layers.iter().enumerate() {
+            if let Some(l) = l {
+                trace!("[{i}] = {:?}", l.ty);
+            } else {
+                trace!("[{i}] = <empty>");
+            }
+        }
         let Some(data) = &mut self.inner else {
             // We are not wrapping this session, passed it through.
             debug!("Unhandled session");
@@ -379,20 +374,23 @@ impl SessionData {
             || image_index.is_none()
         {
             if image_index.is_none() {
-                warn!("end_frame called with begin_frame");
+                warn!("end_frame called without begin_frame");
             } else {
                 warn!("Pose or orientation invalid {view_state_flags:?}, skip passthrough layer");
             }
             let layers = info
                 .layers
                 .iter()
+                .copied()
                 .filter(|l| {
                     l.is_none_or(|l| l.ty != openxr::sys::CompositionLayerPassthroughHTC::TYPE)
                 })
                 .collect::<Vec<_>>();
+            // Also we need to disable ALPHA_BLEND environment_blend_mode.
             let mut info = info.as_raw();
             info.layer_count = layers.len() as _;
             info.layers = layers.as_ptr() as *const _;
+            info.environment_blend_mode = EnvironmentBlendMode::OPAQUE;
             return xrcvt(unsafe { (instance.fp().end_frame)(session.as_handle(), &info) });
         }
         let image_index = image_index.take().unwrap();
@@ -704,7 +702,7 @@ pub(super) unsafe extern "system" fn begin_frame(
     raw_session: openxr::sys::Session,
     info: *mut openxr::sys::FrameBeginInfo,
 ) -> XrErr {
-    debug!("begin frame {:#x} before", raw_session.into_raw());
+    trace!("begin frame {:#x} before", raw_session.into_raw());
     let instance = try_xr!(quark::find_instance(raw_session));
     // Lock the registry entry for the xrSession. this is because xrBeginFrame might unblock
     // a currently blocked xrWaitFrame. Our override for xrWaitFrame will acquire the xrSession
@@ -715,7 +713,7 @@ pub(super) unsafe extern "system" fn begin_frame(
     if ret != XrErr::SUCCESS {
         return ret;
     }
-    debug!("begin frame {:#x} after", raw_session.into_raw());
+    trace!("begin frame {:#x} after", raw_session.into_raw());
     let data = session.hook();
     let Some(data) = &mut data.inner else {
         // We are not wrapping this session, passed it through.
@@ -759,7 +757,7 @@ pub(super) unsafe extern "system" fn wait_frame(
     wait_info: *const openxr::sys::FrameWaitInfo,
     frame_state: *mut openxr::sys::FrameState,
 ) -> XrErr {
-    debug!("wait frame {:#x}, before", raw_session.into_raw());
+    trace!("wait frame {:#x}, before", raw_session.into_raw());
     let fp = {
         // Can't keep the `registered` high-level instance object, because it
         // locks the object registry. but `xrWaitFrame` must be callable from any thread, while

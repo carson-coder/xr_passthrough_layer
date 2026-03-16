@@ -1,4 +1,3 @@
-#![deny(rust_2018_idioms, rust_2024_compatibility, rust_2021_compatibility)]
 pub mod api_layer;
 pub mod camera;
 pub mod config;
