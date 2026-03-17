@@ -124,6 +124,9 @@ impl CameraThread {
             }
             log::trace!("getting camera frame");
             let (frame_data, metadata) = v4l::io::traits::CaptureStream::next(&mut video_stream)?;
+            if metadata.flags.contains(v4l::buffer::Flags::ERROR) {
+                continue;
+            }
             let frame_time = if let Some((camera_reference, reference)) = first_frame_time {
                 let camera_elapsed =
                     std::time::Duration::from(metadata.timestamp) - camera_reference;
