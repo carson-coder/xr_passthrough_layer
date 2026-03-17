@@ -161,7 +161,7 @@ impl StereoUndistortParams {
         ];
         let coeff: [Vec4; 2] = [
             camera_calib.left.intrinsics.distort.coeffs.into(),
-            camera_calib.left.intrinsics.distort.coeffs.into(),
+            camera_calib.right.intrinsics.distort.coeffs.into(),
         ];
         let scale_fov = [0, 1].map(|i| Self::find_scale(&coeff[i], &center[i], &focal[i]));
         Ok(Self {
