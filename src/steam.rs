@@ -2,9 +2,10 @@ use std::os::fd::AsRawFd;
 use std::fs::File;
 use std::io::prelude::*;
 
-use flate2::{Decompress, FlushDecompress};
+use flate2::{Decompress, FlushDecompress, read::ZlibDecoder};
 use nix::{errno::Errno, fcntl::OFlag, ioctl_readwrite_buf, sys::stat::Mode};
 use serde::{Deserialize, Serialize};
+use anyhow::{Context, Result, anyhow, bail};
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
 pub struct Extrinsics {
@@ -52,13 +53,35 @@ pub struct StereoCamera {
     pub left: TrackedCamera,
     pub right: TrackedCamera,
 }
+impl StereoCamera {
+    fn new(cfg: &LighthouseConfig) -> Result<Self> {
+        log::debug!("Trying to find left camera");
+        let left = cfg
+            .tracked_cameras
+            .iter()
+            .copied()
+            .find(|p| p.name == Camera::Left);
+        log::debug!("Trying to find right camera");
+        let right = cfg
+            .tracked_cameras
+            .iter()
+            .copied()
+            .find(|p| p.name == Camera::Right);
+        if left.is_none() {
+            bail!("Failed to find left camera");
+        }
+        if right.is_none() {
+            bail!("Failed to find right camera");
+        }
+        Ok(StereoCamera { left: left.unwrap(), right: right.unwrap() })
+    }
+}
 /// Extract relevant bits of information from steam config files
 #[derive(Serialize, Deserialize)]
 pub struct LighthouseConfig {
     pub tracked_cameras: Vec<TrackedCamera>,
     pub device_serial_number: String
 }
-use anyhow::{Context, Result, anyhow};
 
 ioctl_readwrite_buf!(hidiocgfeature, 'H', 7, u8);
 
@@ -84,7 +107,7 @@ pub fn load_config_file_from_headset() -> Option<StereoCamera> {
             }
         }
         if res.is_err() {
-            log::debug!("Failed to request start of config: {:?}", res.unwrap_err());
+            log::error!("Failed to request start of config: {:?}", res.unwrap_err());
             return None;
         }
       
@@ -101,49 +124,35 @@ pub fn load_config_file_from_headset() -> Option<StereoCamera> {
                 }
             }
             if res.is_err() {
-                log::debug!("Failed to retrieve usb config data: {:?}", res.unwrap_err());
+                log::error!("Failed to retrieve usb config data: {:?}", res.unwrap_err());
                 return None;
             }
-            //for byte in buf.iter().skip(2) {
-            for i in 0..0x3E {
-                config_data.push(buf[i+2]);
-            }
+            config_data.extend_from_slice(&buf[2..buf.len()-1]);
         }
 
-        let mut config: String = "".to_string();
-        {
-            let mut decoder = Decompress::new(true);
-            let mut output: [u8; 0x7FFF] = [0u8; 0x7FFF];
-            decoder.decompress(config_data.as_slice().try_into().expect("Failed to get array for config_data"), &mut output, FlushDecompress::Sync).expect("Failed to decompress data");
-            for byte in &output {
-                if *byte != 0 {
-                    config.push(*byte as char)
-                }
-            }
+        let mut config = String::new();
+        let mut z = ZlibDecoder::new(&config_data[..]);
+        let res = z.read_to_string(&mut config);
+        if res.is_err() {
+            log::error!("Failed to decompress usb data: {:?}", res.unwrap_err());
+            return None;
         }
+
         log::debug!("{:?}", config);
         log::debug!("Trying to parse config");
         let lhconfig: LighthouseConfig = serde_json::from_str(&config).ok()?;
         log::debug!("Serial number: {:?}", lhconfig.device_serial_number);
         let xdg = xdg::BaseDirectories::new();
         let cache = xdg.create_cache_directory("xr_passthrough_layer").expect("Failed to create cache dir");
-        let config_file = cache.join(lhconfig.device_serial_number + ".json");
+        let config_file = cache.join(lhconfig.device_serial_number.clone() + ".json");
         let mut file = File::create(config_file).expect("Failed to open cache file");
         file.write_all(config.as_bytes()).expect("Failed to write headset config");
 
-        log::debug!("Trying to find left camera");
-        let left = lhconfig
-            .tracked_cameras
-            .iter()
-            .copied()
-            .find(|p| p.name == Camera::Left)?;
-        log::debug!("Trying to find right camera");
-        let right = lhconfig
-            .tracked_cameras
-            .iter()
-            .copied()
-            .find(|p| p.name == Camera::Right)?;
-        Some(StereoCamera { left, right })
+        let stereo_config = StereoCamera::new(&lhconfig);
+        if stereo_config.is_err() {
+            log::error!("Failed to get StereoCamera for device {}: {}", stereo_config.as_ref().unwrap_err(), lhconfig.device_serial_number.clone());
+        }
+        Some(stereo_config.unwrap())
     })
 }
 
@@ -165,19 +174,11 @@ fn find_steam_config_steam() -> Option<StereoCamera> {
         let json = std::fs::read_to_string(config).ok()?;
         log::debug!("Trying to parse config");
         let lhconfig: LighthouseConfig = serde_json::from_str(&json).ok()?;
-        log::debug!("Trying to find left camera");
-        let left = lhconfig
-            .tracked_cameras
-            .iter()
-            .copied()
-            .find(|p| p.name == Camera::Left)?;
-        log::debug!("Trying to find right camera");
-        let right = lhconfig
-            .tracked_cameras
-            .iter()
-            .copied()
-            .find(|p| p.name == Camera::Right)?;
-        Some(StereoCamera { left, right })
+        let stereo_config = StereoCamera::new(&lhconfig);
+        if stereo_config.is_err() {
+            log::error!("Failed to get StereoCamera for device {}: {}", stereo_config.as_ref().unwrap_err(), lhconfig.device_serial_number.clone());
+        }
+        Some(stereo_config.unwrap())
     })
 }
 
@@ -192,19 +193,11 @@ fn find_steam_config_cache() -> Option<StereoCamera> {
         let json = std::fs::read_to_string(config.path()).ok()?;
         log::debug!("Trying to parse config");
         let lhconfig: LighthouseConfig = serde_json::from_str(&json).ok()?;
-        log::debug!("Trying to find left camera");
-        let left = lhconfig
-            .tracked_cameras
-            .iter()
-            .copied()
-            .find(|p| p.name == Camera::Left)?;
-        log::debug!("Trying to find right camera");
-        let right = lhconfig
-            .tracked_cameras
-            .iter()
-            .copied()
-            .find(|p| p.name == Camera::Right)?;
-        Some(StereoCamera { left, right })
+        let stereo_config = StereoCamera::new(&lhconfig);
+        if stereo_config.is_err() {
+            log::error!("Failed to get StereoCamera for device {}: {}", stereo_config.as_ref().unwrap_err(), lhconfig.device_serial_number.clone());
+        }
+        Some(stereo_config.unwrap())
     })
 }
 
@@ -229,16 +222,5 @@ pub fn load_steam_config(hmd_serial: &str) -> Result<StereoCamera> {
             .join("config.json"),
     )?;
     let lhconfig: LighthouseConfig = serde_json::from_str(&lhconfig)?;
-    let left = *lhconfig
-        .tracked_cameras
-        .iter()
-        .find(|p| p.name == Camera::Left)
-        .with_context(|| anyhow!("No left camera found"))?;
-    let right = *lhconfig
-        .tracked_cameras
-        .iter()
-        .find(|p| p.name == Camera::Right)
-        .with_context(|| anyhow!("No right camera found"))?;
-
-    Ok(StereoCamera { left, right })
+    StereoCamera::new(&lhconfig)
 }
