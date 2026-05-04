@@ -78,7 +78,7 @@ pub fn load_config_file_from_headset() -> Option<StereoCamera> {
         let mut retries = 0;
         while res.is_err() && retries < 50 {
             retries += 1;
-            buf[0] = 0x10; // IF I HAVE ISSUES IT COULD BE BECAUSE OF NO [8] = 3
+            buf[0] = 0x10;
             unsafe {
                 res = hidiocgfeature(fd.as_raw_fd(), &mut buf);
             }
